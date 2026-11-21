@@ -188,13 +188,13 @@ func TestOnRootFSTranslatesAPathUnderARootBind(t *testing.T) {
 		"70 29 259:2 /home/testuser/repo/data /srv/data2 rw - ext4 /dev/nvme0n1p2 rw\n" +
 		"71 70 259:2 /var/lib/x /srv/data2/inner rw - ext4 /dev/nvme0n1p2 rw\n"))
 	for in, want := range map[string]string{
-		"/srv/data2/app.db-wal":    "/home/testuser/repo/data/app.db-wal",
-		"/srv/data2":               "/home/testuser/repo/data",
-		"/srv/data2/inner/l":       "/var/lib/x/l",
-		"/srv/data20/x":            "/srv/data20/x",
+		"/srv/data2/app.db-wal":        "/home/testuser/repo/data/app.db-wal",
+		"/srv/data2":                   "/home/testuser/repo/data",
+		"/srv/data2/inner/l":           "/var/lib/x/l",
+		"/srv/data20/x":                "/srv/data20/x",
 		"/home/testuser/code/linked/f": "/home/testuser/elsewhere/f",
-		"/srv/data/x":              "/srv/data/x",
-		"/etc/ro/f":                "/etc/ro/f",
+		"/srv/data/x":                  "/srv/data/x",
+		"/etc/ro/f":                    "/etc/ro/f",
 	} {
 		if got := onRootFS(binds, in); got != want {
 			t.Errorf("onRootFS(%q) = %q, want %q", in, got, want)

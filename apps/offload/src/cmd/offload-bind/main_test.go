@@ -26,7 +26,7 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	// setgroups is refused in an unprivileged user namespace.
-	setCreds = func(int, int, []int) error { return nil }
+	setCreds = func(uint32, uint32, []uint32) error { return nil }
 	code := run(os.Args[1:], os.Stderr)
 	got, _ := os.ReadFile(probe + "/f")
 	fmt.Println(string(got))
@@ -34,6 +34,23 @@ func TestMain(m *testing.M) {
 		fmt.Println(strerror.Of(errnoOf(err)))
 	}
 	os.Exit(code)
+}
+
+func TestRunRejectsInvalidCredentialIDs(t *testing.T) {
+	defer replace(&setCreds, func(uint32, uint32, []uint32) error {
+		t.Fatal("invalid credentials reached the kernel boundary")
+		return nil
+	})()
+	for _, args := range [][]string{
+		{"-1", "1000", ""},
+		{"1000", "4294967296", ""},
+		{"1000", "1000", "1000,4294967296"},
+	} {
+		var stderr bytes.Buffer
+		if code := run(args, &stderr); code != 1 || !strings.Contains(stderr.String(), "strconv.ParseUint") {
+			t.Errorf("run(%q) = %d, stderr %q; want an ID parsing error", args, code, &stderr)
+		}
+	}
 }
 
 // A job root standing in for a mount of dev's filesystem.
@@ -110,7 +127,7 @@ func bindRun(t *testing.T, mount func(src string) syscall.Errno, remount syscall
 		fmt.Fprintln(&mounts, "read-only", dst)
 		return remount
 	})()
-	defer replace(&setCreds, func(int, int, []int) error { return nil })()
+	defer replace(&setCreds, func(uint32, uint32, []uint32) error { return nil })()
 	code := run(append([]string{"1000", "1000", "1000"}, args...), &stderr)
 	return code, mounts.String(), stderr.String()
 }

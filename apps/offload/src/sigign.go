@@ -16,6 +16,7 @@ package main
 #include <pthread.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 static unsigned long long inherited_ignores, inherited_blocks;
 static int closed_stdio;
@@ -39,6 +40,8 @@ static int closedStdio(void) { return closed_stdio; }
 static void die_by(int s) {
 	struct rlimit none = {0, 0};
 	setrlimit(RLIMIT_CORE, &none);
+	// Piped core handlers ignore RLIMIT_CORE.
+	prctl(PR_SET_DUMPABLE, 0L, 0L, 0L, 0L);
 	struct sigaction a = {0};
 	a.sa_handler = SIG_DFL;
 	sigaction(s, &a, 0);

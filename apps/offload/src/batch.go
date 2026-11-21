@@ -14,7 +14,7 @@ import (
 
 // batchScope is the low-priority user scope every local run goes in; scripts/benchmark
 // runs its "batch" local runs with the same properties.
-var batchScope = []string{"systemd-run", "--user", "--scope", "--quiet", "-p", "CPUWeight=10", "--"}
+var batchScope = []string{"systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", "-p", "CPUWeight=10", "--"}
 
 // viaEnv starts every command the way the launcher starts a remote one, so a run reads
 // the same wherever it lands: leading NAME=value words set variables, and a command that

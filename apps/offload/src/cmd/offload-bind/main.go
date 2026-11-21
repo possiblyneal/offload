@@ -75,16 +75,16 @@ func run(argv []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "offload-bind: usage: offload-bind UID GID GROUPS BIND [BIND...]")
 		return 1
 	}
-	uid, uidErr := strconv.Atoi(argv[0])
-	gid, gidErr := strconv.Atoi(argv[1])
-	var groups []int
+	uid, uidErr := strconv.ParseUint(argv[0], 10, 32)
+	gid, gidErr := strconv.ParseUint(argv[1], 10, 32)
+	var groups []uint32
 	var groupErr error
 	for g := range strings.SplitSeq(argv[2], ",") {
 		if g == "" {
 			continue
 		}
-		n, err := strconv.Atoi(g)
-		groups, groupErr = append(groups, n), errors.Join(groupErr, err)
+		n, err := strconv.ParseUint(g, 10, 32)
+		groups, groupErr = append(groups, uint32(n)), errors.Join(groupErr, err)
 	}
 	if err := errors.Join(uidErr, gidErr, groupErr); err != nil {
 		fmt.Fprintf(stderr, "offload-bind: %v\n", err)
@@ -95,7 +95,7 @@ func run(argv []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if err := setCreds(uid, gid, groups); err != nil {
+	if err := setCreds(uint32(uid), uint32(gid), groups); err != nil {
 		fmt.Fprintf(stderr, "offload-bind: setgroups: %s\n", strerror.Of(err.(syscall.Errno)))
 		return 1
 	}
@@ -217,16 +217,12 @@ func errnoOf(err error) syscall.Errno {
 // realSetCreds gives this thread the job user's groups and filesystem uid and gid, leaving
 // its real and effective ids, and so CAP_SYS_ADMIN, as they are. A raw syscall, since
 // syscall.Setgroups changes every thread's.
-func realSetCreds(uid, gid int, groups []int) error {
-	gids := make([]uint32, len(groups))
-	for i, g := range groups {
-		gids[i] = uint32(g)
-	}
+func realSetCreds(uid, gid uint32, groups []uint32) error {
 	var p unsafe.Pointer
-	if len(gids) > 0 {
-		p = unsafe.Pointer(&gids[0])
+	if len(groups) > 0 {
+		p = unsafe.Pointer(&groups[0])
 	}
-	if _, _, e := syscall.RawSyscall(syscall.SYS_SETGROUPS, uintptr(len(gids)), uintptr(p), 0); e != 0 {
+	if _, _, e := syscall.RawSyscall(syscall.SYS_SETGROUPS, uintptr(len(groups)), uintptr(p), 0); e != 0 {
 		return e
 	}
 	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)

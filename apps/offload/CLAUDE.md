@@ -275,7 +275,8 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 - Every local run (a refusal, a fallback, `--where local`) goes in a
   `systemd-run --user --scope -p CPUWeight=10` scope; local slots are unlimited. With no
   user manager answering (as root under sudo) it runs outside a scope at normal priority,
-  saying so on stderr (`batch.go`).
+  saying so on stderr (`batch.go`). The scope requires `systemd-run` with
+  `--expand-environment=no` so it passes command arguments literally.
 
 - Every placement starts the command through `/usr/bin/env --` (`viaEnv`), so a leading `NAME=value` word sets a variable and a missing command
   exits 127 (126 when it cannot run) with env's message.
