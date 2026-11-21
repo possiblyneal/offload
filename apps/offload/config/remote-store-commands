@@ -1,0 +1,17 @@
+# Commands that use a store config/remote-local-paths keeps on the remote's own disk, so
+# they run on dev under every --where (the remote-local rule). Container tools keep their
+# images and containers under ~/.local/share/containers and ~/.cache/containers: offloaded,
+# a build's image would stay on the remote. A cache command would clean the remote's copy
+# and leave dev's as it was. Entries are read as config/local-only's are.
+podman
+podman-compose
+buildah
+skopeo
+docker
+docker-compose
+go clean
+uv cache
+pre-commit clean
+pre-commit gc
+pre_commit clean
+pre_commit gc

@@ -1,0 +1,13 @@
+[Unit]
+Description=At stop, fail offloaded jobs' NFS calls so their scopes can stop with dev down
+# Job scopes are ordered Before= this unit, so at shutdown its stop runs first.
+# install.sh starts it and never restarts it: a stop cuts every running job.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=-/usr/local/libexec/offload-launch --cut
+
+[Install]
+WantedBy=multi-user.target

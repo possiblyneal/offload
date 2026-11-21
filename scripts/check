@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The full local gate, in the order below. Local means it reads no hosted
+# GitHub state, not that it stays offline: commitlint-test and pre-commit's own
+# hook environments fetch on first use.
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# By default only the Result table reaches the caller, because the rest of the
+# run -- pre-commit's hook list, test progress, compiler noise -- is what an
+# agent would otherwise read to learn what the table already says. The filter is
+# scripts/summarize rather than a second one here: check runs itself under it
+# with --verbose, so the raw run still exists, and the exit status is the
+# gate's because summarize passes its command's through.
+#
+# The full run is written to tmp/check.log every time, passing or failing. A
+# pre-commit fixer repairs the file and exits non-zero, so a re-run passes and
+# the cause is gone; the log is what a failure outside the table is diagnosed
+# from. --verbose streams the same text live. --gate is the internal entry that
+# runs the steps below and nothing else, so the tee wraps exactly one run.
+#
+# --fast is the commit-time gate: every step below except build, which CI runs
+# on the same commit before it can land and which costs more than the rest of
+# the gate together in a repository that compiles. It rides through each entry,
+# and tmp/check.log opens by saying build was left out, so a fast run's log
+# never reads as the full gate's.
+usage() {
+  echo "usage: scripts/check [--fast] [--verbose]" >&2
+  exit 2
+}
+mode=""
+fast=()
+for arg in "$@"; do
+  case "$arg" in
+    --verbose | --gate)
+      [[ -z "$mode" ]] || usage
+      mode="$arg"
+      ;;
+    --fast) fast=(--fast) ;;
+    *) usage ;;
+  esac
+done
+case "$mode" in
+  "")
+    exec scripts/summarize scripts/check --verbose "${fast[@]}"
+    ;;
+  --verbose)
+    mkdir -p tmp
+    # pipefail (set above) makes the pipeline's status the gate's, not tee's.
+    scripts/check --gate "${fast[@]}" 2>&1 | tee tmp/check.log
+    exit "${PIPESTATUS[0]}"
+    ;;
+esac
+
+if (( ${#fast[@]} )); then
+  echo "scripts/check --fast: build is left to CI."
+fi
+
+if [[ ! -x scripts/doctor ]]; then
+  echo "scripts/doctor is missing or not executable."
+  exit 1
+fi
+
+scripts/doctor
+
+# Where a file sits, checked before what is in it. A misplaced file passes every
+# language check in this repository, because each one reads the manifests and
+# never asks whether the tree around them matches the rules.
+if [[ ! -x scripts/structure ]]; then
+  echo "scripts/structure is missing or not executable."
+  exit 1
+fi
+
+scripts/structure </dev/null
+
+# Whether this repository's own .github/ still matches the copy it ships to
+# generated repositories. Reports not-applicable where there is no payload,
+# which is every repository generated from one.
+if [[ ! -x scripts/payload-parity ]]; then
+  echo "scripts/payload-parity is missing or not executable."
+  exit 1
+fi
+
+scripts/payload-parity </dev/null
+
+if [[ ! -x scripts/script-tests ]]; then
+  echo "scripts/script-tests is missing or not executable."
+  exit 1
+fi
+
+if [[ ! -x scripts/ci ]]; then
+  echo "scripts/ci is missing or not executable."
+  exit 1
+fi
+
+# The script tests verify the language-capabilities interface, its workflow
+# adapters, and that routine local commands stay offline. They run beside ci
+# rather than before it, because both spend most of their time waiting on git
+# and child processes, so neither fills the CPUs and the pair takes as long as
+# ci alone. Both only read the tree. pre-commit's sweep below stays after them,
+# since its fixers rewrite files that ci's linters and tests read.
+#
+# The suites' output is held and printed whole once ci has finished, so the two
+# never interleave, and both must pass. A background job in a non-interactive
+# shell ignores SIGINT, so an interrupt exits the gate at once, without waiting
+# for the suites, and the EXIT trap stops them rather than leaving them running.
+# set -m starts the suites in a process group of their own, so one signal to the
+# group reaches every suite at once, including one started mid-shutdown. Being
+# their own group, a signal to the gate's group misses them: TERM still reaches
+# the trap, and PIPE, from an output pipe the same signal closed, gets one too.
+# A group SIGKILL runs no trap, so the suites finish on their own.
+script_tests_log="$(mktemp)"
+set -m
+scripts/script-tests </dev/null >"$script_tests_log" 2>&1 &
+script_tests_pid=$!
+set +m
+trap 'kill -- -"$script_tests_pid" 2>/dev/null || true; rm -f "$script_tests_log"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 141' PIPE
+
+ci_args=()
+if (( ${#fast[@]} )); then
+  ci_args=(--no-build)
+fi
+ci_status=0
+scripts/ci "${ci_args[@]}" || ci_status=$?
+script_tests_status=0
+wait "$script_tests_pid" || script_tests_status=$?
+# Reaped, so its PID may now belong to another process.
+trap 'rm -f "$script_tests_log"' EXIT
+trap - INT TERM PIPE
+cat "$script_tests_log"
+(( ci_status == 0 )) || exit "$ci_status"
+(( script_tests_status == 0 )) || exit "$script_tests_status"
+
+# The security workflow blocks a pull request the same way the CI workflow does,
+# so leaving it out here means finding out on the pull request instead of before
+# the commit.
+if [[ ! -x scripts/security ]]; then
+  echo "scripts/security is missing or not executable."
+  exit 1
+fi
+
+scripts/security
+
+# The commit hooks see staged files only, so a file stays unchecked until it is
+# next touched: a hook added today never reaches the files already committed,
+# and a rename out of a recognized type stops the checks with nothing reporting
+# it. This is the sweep that covers them. doctor above already fails when the
+# config is present and the tool or the installed hook is missing.
+#
+# no-commit-to-branch is skipped rather than run. It reads the current branch
+# instead of any file, so on main it fails this whole sweep for a commit that
+# is not being made.
+#
+# So is every hook that repeats a step this gate already ran over the whole
+# tree: structure and payload-parity above, and the template repository's
+# addon-adoption and reference-assertions, which are test files its pytest run
+# in ci collects. They stay on at commit time, where nothing else runs them.
+# Naming a hook a repository lacks skips nothing.
+skip=no-commit-to-branch,structure,payload-parity,addon-adoption,reference-assertions
+if [[ -s .pre-commit-config.yaml ]]; then
+  echo
+  echo "Running pre-commit across all files"
+  SKIP="$skip" pre-commit run --all-files
+
+  # --all-files means every file Git knows about, so a file written but not yet
+  # staged is not one of them. That is this sweep's blind spot at the moment it
+  # matters most: a new script reads as covered here and then fails the hook at
+  # commit time, having never been looked at. --files takes a path whether or
+  # not Git tracks it, which is what closes the gap.
+  #
+  # --exclude-standard so an ignored path stays ignored; -z and -d '' so a name
+  # containing whitespace stays one argument.
+  untracked=()
+  while IFS= read -r -d '' path; do
+    untracked+=("$path")
+  done < <(git ls-files --others --exclude-standard -z 2>/dev/null)
+
+  if (( ${#untracked[@]} )); then
+    echo
+    echo "Running pre-commit across ${#untracked[@]} untracked file(s)"
+    SKIP="$skip" pre-commit run --files "${untracked[@]}"
+  fi
+fi

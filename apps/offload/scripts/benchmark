@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# The offload benchmark gate: does offloading a cold Go test beat running it
+# locally under dev load by 30%? Prints one table per job family; the verdict compares
+# medians.
+#
+#   benchmark [--reps N] [--remote NAME] [--label TEXT] [--skip-small-files]
+#
+# Configurations, interleaved N times (1 2 3 1 2 3 ...), each with a fresh empty GOCACHE:
+#   1-light    local, no synthetic load
+#   2-batch    local in a CPUWeight=10 user scope, synthetic load at the default weight
+#   3-offload  offloaded to the remote, same synthetic load running on dev
+# The synthetic load is 36 busy-loop processes with a 16 MiB working set each, started in
+# its own user scope and stopped on exit, failure included. Dev is shared, so `bg_run` is
+# the runnable-process count dev had just before the run (and its synthetic load) started (the load
+# average would still carry the previous run).
+# Then, with no synthetic load, `npm ci` and `git status` local versus offloaded (the
+# many-small-files check). Needs the installed `offload`, the remote and passwordless ssh.
+set -euo pipefail
+
+UNIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(git -C "$UNIT" rev-parse --show-toplevel)"
+WORKLOAD="$UNIT/src"
+reps=3 remote=server label="" small=1
+while (($#)); do
+  case $1 in
+    --reps) reps=$2; shift 2 ;;
+    --remote) remote=$2; shift 2 ;;
+    --label) label=$2; shift 2 ;;
+    --skip-small-files) small=0; shift ;;
+    *) echo "usage: benchmark [--reps N] [--remote NAME] [--label TEXT] [--skip-small-files]" >&2; exit 2 ;;
+  esac
+done
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" # agent shells lack it; systemd-run --user needs it
+
+die() { echo "benchmark: $*" >&2; exit 1; }
+command -v offload >/dev/null || die "offload is not installed (run apps/offload/install.sh)"
+addr=$(awk -v r="$remote" '$1 == "remote" && $2 == r { print $3 }' "$UNIT/config/offload.conf")
+[[ -n $addr ]] || die "remote $remote is not in config/offload.conf"
+ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 "$addr" true || die "cannot ssh to $remote ($addr)"
+
+TMP="$ROOT/tmp/offload-benchmark/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$TMP"
+ROWS="$TMP/rows.tsv"
+LOAD_UNIT=offload-bench-load
+load_pid=
+
+# timed <log> <cmd...>: run cmd with its output in <log>; its CPU seconds go to stderr.
+cat >"$TMP/timed" <<'TIMED'
+#!/usr/bin/env bash
+log=$1; shift
+TIMEFORMAT='CPU %U %S'
+time "$@" >"$log" 2>&1
+TIMED
+chmod +x "$TMP/timed"
+
+nfsd_ticks() { for p in $(pgrep -x nfsd); do awk '{ print $14 + $15 }' "/proc/$p/stat"; done | awk '{ s += $1 } END { print s + 0 }'; }
+nfsd_state() { echo "$(pgrep -x nfsd | wc -l) threads, nice $(ps -o ni= -p "$(pgrep -x nfsd | head -1)" | tr -d ' ')"; }
+loadavg1() { cut -d' ' -f1 /proc/loadavg; }
+runnable() { read -r _ _ _ r _ </proc/loadavg && echo $((${r%%/*} - 1)); }
+bg_runnable() { for _ in 1 2 3; do runnable; sleep 1; done | awk '{ s += $1 } END { printf "%.1f", s / NR }'; }
+
+start_load() {
+  systemd-run --user --scope --quiet --collect --unit="$LOAD_UNIT" python3 -I -c '
+import os
+for _ in range(36):
+    if os.fork() == 0:
+        b = bytearray(16 << 20)
+        i = 0
+        while True:
+            b[(i * 4096) % len(b)] = 1
+            i += 1
+for _ in range(36):
+    os.wait()
+' &
+  load_pid=$!
+  sleep 20 # let the load average and the pressure reach the load
+}
+stop_load() {
+  if [[ -n $load_pid ]]; then
+    systemctl --user stop "$LOAD_UNIT.scope" 2>/dev/null || true
+    wait "$load_pid" 2>/dev/null || true
+    load_pid=
+  fi
+}
+trap stop_load EXIT
+
+sample() { # one "load1 runnable psi" line a second
+  while :; do
+    echo "$(loadavg1) $(runnable) $(awk -F'[ =]' 'NR == 1 { print $3 }' /proc/pressure/cpu)"
+    sleep 1
+  done
+}
+
+# measure <job> <config> <loaded 0|1> <command...>: run once, append a row to $ROWS.
+n=0
+measure() {
+  local job=$1 config=$2 loaded=$3 bg rc=0 sampler t0 ticks0 ticks1 wall end_load cpu
+  shift 3
+  n=$((n + 1))
+  bg=$(bg_runnable)
+  ((loaded)) && start_load
+  sample >"$TMP/samples-$n" &
+  sampler=$!
+  ticks0=$(nfsd_ticks)
+  t0=$(date +%s.%N)
+  "$@" 2>"$TMP/stderr-$n" || rc=$?
+  wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.2f", b - a }')
+  ticks1=$(nfsd_ticks)
+  end_load=$(loadavg1)
+  kill "$sampler"
+  wait "$sampler" 2>/dev/null || true
+  stop_load
+  ((rc == 0)) || die "run $n ($job, $config) exited $rc; see $TMP/stderr-$n and $TMP/log-$n"
+  cpu=$(awk '/^CPU/ { c = $2 + $3 } END { printf "%.2f", c }' "$TMP/stderr-$n")
+  awk -v n="$n" -v job="$job" -v config="$config" -v wall="$wall" -v cpu="$cpu" \
+    -v bg="$bg" -v end_load="$end_load" -v t0="$ticks0" -v t1="$ticks1" '
+    { r += $2; p += $3; c++ }
+    END { printf "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%.2f\n", n, job, config, wall, cpu, bg, end_load, r / c, p / c, (t1 - t0) / 100 }
+  ' "$TMP/samples-$n" >>"$ROWS"
+}
+
+median() { sort -n | awk '{ a[NR] = $1 } END { print (NR % 2) ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2 }'; }
+# median_of <job> <config> <field>
+median_of() { awk -F'\t' -v j="$1" -v c="$2" -v f="$3" '$2 == j && $3 == c { print $f }' "$ROWS" | median; }
+
+print_table() {
+  printf '%-4s %-11s %-10s %8s %8s %8s %9s %9s %9s %10s\n' run job config wall_s cpu_s bg_run end_load runnable psi_avg10 nfsd_cpu_s
+  awk -F'\t' '{ printf "%-4s %-11s %-10s %8s %8s %8s %9s %9s %9s %10s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 }' "$ROWS"
+}
+
+state="nfsd on dev: $(nfsd_state)${label:+ ($label)}"
+echo "benchmark: $state; records in $TMP" >&2
+
+# Warm the module cache on both machines (untimed): the benchmark is the cold build cache.
+(cd "$WORKLOAD" && go mod download)
+(cd "$WORKLOAD" && offload --where "$remote" -- go mod download) || die "offload failed on the warm-up"
+
+go_local() {
+  (cd "$WORKLOAD" && "$TMP/timed" "$TMP/log-$n" env GOCACHE="$TMP/gocache-$n" go test -count=1 ./...)
+}
+go_scope() {
+  (cd "$WORKLOAD" && systemd-run --user --scope --quiet -p CPUWeight=10 -- \
+    "$TMP/timed" "$TMP/log-$n" env GOCACHE="$TMP/gocache-$n" go test -count=1 ./...)
+}
+go_offload() { # a cold GOCACHE on the remote's own disk (~/.cache/go-build is remote-local), removed after
+  # shellcheck disable=SC2016 # expanded by the job's own sh
+  (cd "$WORKLOAD" && offload --where "$remote" -- sh -c \
+    '"$1" "$2" env GOCACHE="$3" go test -count=1 ./...; rc=$?; rm -rf "$3"; exit "$rc"' \
+    sh "$TMP/timed" "$TMP/log-$n" "$HOME/.cache/go-build/offload-benchmark-${TMP##*/}-$n")
+}
+
+for ((i = 0; i < reps; i++)); do
+  measure go-test 1-light 0 go_local
+  measure go-test 2-batch 1 go_scope
+  measure go-test 3-offload 1 go_offload
+done
+
+echo
+echo "go test -count=1 ./... in apps/offload/src, cold GOCACHE; $state"
+echo "run order: $(awk -F'\t' '{ printf "%s ", $1 "=" $3 }' "$ROWS")"
+print_table
+for c in 1-light 2-batch 3-offload; do
+  printf 'median %-10s wall %7.2f s  cpu %7.2f s  nfsd cpu %6.2f s\n' "$c" \
+    "$(median_of go-test "$c" 4)" "$(median_of go-test "$c" 5)" "$(median_of go-test "$c" 10)"
+done
+awk -v m2="$(median_of go-test 2-batch 4)" -v m3="$(median_of go-test 3-offload 4)" 'BEGIN {
+  gain = (m2 - m3) / m2 * 100
+  printf "VERDICT %s: offloaded median %.2f s vs batch-scope local median %.2f s, %.1f%% faster (threshold 30%%)\n", (gain >= 30 ? "PASS" : "FAIL"), m3, m2, gain
+}'
+
+((small)) || exit 0
+
+# Many small files, no synthetic load. npm ci uses a cache warmed once and runs offline, so
+# the network is out of the timing; each run installs into a fresh copy of the lockfile.
+mkdir -p "$TMP/npm-src"
+cp "$ROOT/package.json" "$ROOT/package-lock.json" "$TMP/npm-src/"
+(cd "$TMP/npm-src" && npm ci --cache "$TMP/npm-cache" --ignore-scripts --no-audit --no-fund >"$TMP/npm-warm.log" 2>&1)
+npm_args=(--offline --cache "$TMP/npm-cache" --ignore-scripts --no-audit --no-fund)
+npm_dir() {
+  rm -rf "${TMP:?}/npm-$n"
+  mkdir "$TMP/npm-$n"
+  cp "$TMP/npm-src/package.json" "$TMP/npm-src/package-lock.json" "$TMP/npm-$n/"
+}
+npm_local() { npm_dir && (cd "$TMP/npm-$n" && "$TMP/timed" "$TMP/log-$n" npm ci "${npm_args[@]}"); }
+npm_offload() { npm_dir && (cd "$TMP/npm-$n" && offload --where "$remote" -- "$TMP/timed" "$TMP/log-$n" npm ci "${npm_args[@]}"); }
+status_local() { (cd "$ROOT" && GIT_OPTIONAL_LOCKS=0 "$TMP/timed" "$TMP/log-$n" git status); }
+status_offload() { (cd "$ROOT" && GIT_OPTIONAL_LOCKS=0 offload --where "$remote" -- "$TMP/timed" "$TMP/log-$n" git status); }
+
+: >"$ROWS"
+for ((i = 0; i < reps; i++)); do
+  measure npm-ci local 0 npm_local
+  measure npm-ci offload 0 npm_offload
+  measure git-status local 0 status_local
+  measure git-status offload 0 status_offload
+done
+echo
+echo "many small files, no synthetic load; $state; $(git -C "$ROOT" ls-files | wc -l) tracked files in the repository"
+print_table
+for job in npm-ci git-status; do
+  for where in local offload; do
+    printf 'median %-11s %-8s wall %7.2f s  cpu %7.2f s  nfsd cpu %6.2f s\n' "$job" "$where" \
+      "$(median_of "$job" "$where" 4)" "$(median_of "$job" "$where" 5)" "$(median_of "$job" "$where" 10)"
+  done
+done

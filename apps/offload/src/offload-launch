@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# Runs one job on a remote, as root, inside a mount namespace of its own.
+#
+#   offload-launch DEV_ADDR UID GID GROUPS CWD WRITABLE READONLY SOCKETS -- COMMAND [ARGS...]
+#
+# WRITABLE and READONLY are newline-separated path lists, SOCKETS a space-separated one.
+#
+# The caller's environment arrives on stdin as NUL-terminated NAME=value entries (a
+# command line is world-readable here). The job sees dev's filesystem read-only, the
+# WRITABLE paths read-write (less the READONLY paths inside them), this machine's /proc,
+# /sys and /dev (less /dev/shm and /dev/mqueue, which are its own, in an IPC namespace of
+# its own), the remote-local tool caches, and an empty /run. Dev's /tmp and /var/tmp come
+# among the WRITABLE paths: dev exports /tmp beside /. It runs as UID with GROUPS, in CWD,
+# ignoring the signals OFFLOAD_IGNORE lists and blocking those OFFLOAD_BLOCK lists (the
+# caller's), with the umask OFFLOAD_UMASK, the soft open-file limit OFFLOAD_NOFILE and the
+# other soft limits OFFLOAD_RLIMITS, prlimit's `name=value` words (the caller's; each limit
+# capped at this machine's hard one). Its stdin is what follows the environment block on this one (empty unless the
+# wrapper forwarded the caller's). Its parent is offload-wait, which fails the run when a
+# write to dev failed at writeback or the job left files in its private /dev/shm or
+# /dev/mqueue; a step that fails after `go`, before the job runs,
+# exits 125 and says so.
+#
+# OFFLOAD_CTL names the control channel: two fifos under /run/offload-ctl/<id> that a second
+# ssh session bridges to the wrapper (`offload-launch --control <id>`). On it the launcher
+# writes `hb`, `ready` (the job is set up), `started` (just before it execs the job),
+# `offset out|err <n>` (where the job left an output file it wrote itself) and
+# `status exit <n>|signal <n>|oom-kill`; it reads `go` (the wrapper's answer to `ready`: the job runs
+# only after it, so a wrapper that never sent it knows nothing ran), `ping` (the wrapper's
+# heartbeat), `sig INT|TERM|HUP|QUIT|USR1|USR2|TSTP|CONT` (sent to the job's process
+# group; after INT, TERM, HUP or QUIT the scope is stopped OFFLOAD_GRACE seconds later),
+# `eow out|err` (the caller's reader of that stream is gone: offload-wait closes its relay
+# of it, so the job's next write to it fails as it would have locally) and `eof`. Silence for
+# $silence seconds, or `eof`, stops the scope: a dead peer leaves no job behind.
+# OFFLOAD_SLOTS is the number of jobs this machine accepts at once: the launcher takes an
+# exclusive flock on one of that many slot files under /var/lib/offload/slots (this machine's
+# own disk: NFS emulates flock with fcntl locks and cannot be trusted) and holds it until
+# it exits, so a job that ends, or is stopped by the watchdog, frees its slot. With none
+# free it writes `noslot` on the control channel and starts nothing. `--slots N` prints how
+# many of N are free.
+# OFFLOAD_CPU_QUOTA and OFFLOAD_MEMORY_MAX cap the scope (default: all threads but one,
+# 75% of RAM).
+#
+# Nothing is mounted in this machine's own mount namespace: the unshare below makes
+# every mount private to the job, and they vanish with its last process. A host-level
+# mount would leak into containers that mount / with rslave (node-exporter).
+set -euo pipefail
+
+libexec=/usr/local/libexec
+local_paths=/etc/offload/remote-local-paths
+local_store=/var/lib/offload
+
+# nosharecache: each mount gets a superblock, and so an attribute cache, of its own. A
+# shared one would show a new job a file as another job's cache last saw it, for up to
+# acregmax (60 s).
+nfs_opts=vers=4.2,proto=tcp,lookupcache=positive,acdirmax=3,nosharecache
+ctl_root=/run/offload-ctl
+slot_dir=$local_store/slots
+silence=10 # seconds without a ping from the wrapper before the job is stopped
+
+if [[ ${1:-} == --slots ]]; then
+  [[ ${2:-} =~ ^[0-9]+$ ]] || exit 2
+  install -d -m 0700 "$slot_dir"
+  free=0
+  for ((i = 1; i <= $2; i++)); do
+    # A lock taken and dropped in a subshell: free if it could be taken. A launcher
+    # claiming at that instant sees the slot busy and may answer noslot; --explain only.
+    if (exec 7>>"$slot_dir/$i" && flock -n 7); then free=$((free + 1)); fi
+  done
+  echo "$free"
+  exit 0
+fi
+
+if [[ ${1:-} == --cut ]]; then
+  # Fails every NFS call of every job, now and later. A process exiting with a file open
+  # on dev waits on the CLOSE call, which neither SIGKILL nor `soft` ends; with dev
+  # unreachable that blocks the scope's stop, and with it this machine's shutdown.
+  # offload-cut.service runs this when it stops, and every job's scope stops after it.
+  # Only superblocks the host's mount namespace does not hold: offload-forward runs in that
+  # namespace inside the scope, and a job's namespace starts as a copy of it, so an NFS
+  # mount of the host's appears in both. OFFLOAD_HOST_PID stands in for pid 1 in the test.
+  sbs() { awk '$0 ~ / - nfs4 / { print $3 }' "/proc/$1/mountinfo" 2>/dev/null || true; }
+  host_sbs=$(sbs "${OFFLOAD_HOST_PID:-1}")
+  # Every superblock is tried, one gone since it was listed (its job ended) skipped: one
+  # that fails must not leave the rest uncut. A failure is said and fails the run.
+  for procs in /sys/fs/cgroup/system.slice/offload-job-*.scope/cgroup.procs; do
+    [[ -e $procs ]] || continue
+    while read -r pid; do
+      sbs "$pid"
+    done <"$procs" 2>/dev/null || true # its scope gone since the glob
+  done | sort -u | { grep -vxF -e "$host_sbs" -e '' || true; } | {
+    rc=0
+    while read -r sb; do
+      [[ -e /sys/fs/nfs/$sb/shutdown ]] || continue
+      echo 1 >"/sys/fs/nfs/$sb/shutdown" || { echo "offload-launch: cutting NFS superblock $sb failed" >&2; rc=1; }
+    done
+    ((rc == 0))
+  }
+  exit 0
+fi
+
+if [[ ${1:-} == --control ]]; then
+  # The bridge: runs in the second ssh session. Its stdin is the wrapper's records and its
+  # stdout the launcher's. It tells the launcher it is attached before anything starts.
+  [[ ${2:-} =~ ^[0-9a-f-]+$ ]] || exit 2
+  d=$ctl_root/$2
+  for _ in $(seq 100); do [[ -p $d/in && -p $d/out ]] && break; sleep 0.1; done
+  [[ -p $d/in && -p $d/out ]] || exit 1
+  exec 3<>"$d/in" 4<>"$d/out"
+  echo attached >&3
+  { cat; echo eof; } <&0 >&3 &
+  feeder=$!
+  trap 'kill "$feeder" 2>/dev/null' EXIT
+  # The wrapper closes its end only once it has read all it wants: with the feeder gone,
+  # nobody reads what this would relay.
+  # A read that times out keeps the part of a line it got in $line, and the next read
+  # starts mid-line, so the part is carried over rather than dropped.
+  pend=''
+  while :; do
+    if IFS= read -t 5 -r line <&4; then
+      line=$pend$line pend=''
+      echo "$line"
+      [[ $line == status* ]] && exit 0
+    else
+      pend+=$line
+      if [[ ! -d $d ]] || ! kill -0 "$feeder" 2>/dev/null; then exit 1; fi
+    fi
+  done
+fi
+
+if [[ -z ${OFFLOAD_JOB_DIR:-} ]]; then
+  # Host namespace: make the job's directory, which holds every mount point the job uses,
+  # run the job in a scope of its own, remove the directory. A job can leave a process
+  # behind (rootless podman's pause process) that keeps the job's mount namespace, and so
+  # its mounts, alive; killing the scope ends them.
+  dev=$1 uid=$2 gid=$3 groups=$4 socks=$8
+
+  # sshd leaves a forward's socket behind when its connection ends: it unlinks one only to
+  # bind over it. So each one in /tmp that nothing listens on goes here, once it is two
+  # minutes old, so that a socket sshd has bound but not yet listened on stays. A glob, not
+  # `find /tmp`: find fails when any other /tmp entry vanishes mid-scan, which under
+  # set -e would end the launcher before its control channel exists. One stat for every
+  # socket, NUL-separated (a name may hold a newline); one that vanished since the glob is
+  # left out of its output.
+  listening=$(ss -xlnH | awk '{ print $5 }')
+  socks_now=(/tmp/offload-*.sock)
+  while IFS=' ' read -r -d '' mtime s; do
+    if [[ ! -S $s ]] || ((EPOCHSECONDS - mtime < 120)); then continue; fi
+    grep -qxF -- "$s" <<<"$listening" || rm -f -- "$s"
+  done < <(stat --printf '%Y %n\0' -- "${socks_now[@]}" 2>/dev/null || true)
+
+  [[ ${OFFLOAD_CTL:-} =~ ^[0-9a-f-]+$ ]] || { echo "offload-launch: OFFLOAD_CTL is not set" >&2; exit 2; }
+  unit=offload-job-$$.scope
+  rc=0
+  ctl=$ctl_root/$OFFLOAD_CTL
+  grace=${OFFLOAD_GRACE:-10}
+  cpu_quota=${OFFLOAD_CPU_QUOTA:-$(($(nproc) > 1 ? ($(nproc) - 1) * 100 : 100))%}
+  memory_max=${OFFLOAD_MEMORY_MAX:-$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) * 75 / 100))K}
+
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  cleanup() {
+    # The monitor, on any exit before the job's end (a failed scope start, a signal).
+    [[ -z ${monitor_pid:-} ]] || kill "$monitor_pid" 2>/dev/null || true
+    systemctl kill --signal=SIGKILL "$unit" 2>/dev/null || true
+    # stop returns once the scope is gone, which its NFS superblocks' teardown makes take a
+    # fifth of a second; 5 s at most, as dev being down can hold a dying process for good.
+    timeout 5 systemctl stop "$unit" 2>/dev/null || true
+    systemctl reset-failed "$unit" 2>/dev/null || true # an OOM-killed scope stays failed
+    rm -rf "$ctl"
+    # sshd leaves this job's forward sockets behind (see above).
+    # shellcheck disable=SC2086 # the sockets are a space-separated list
+    [[ -z $socks ]] || rm -f $socks
+    # rmdir, never rm -r: a mount point still mounted would take dev's files with it.
+    [[ -z ${jobdir:-} ]] || rmdir "$jobdir/root" "$jobdir/rw" "$jobdir/ro" "$jobdir" 2>/dev/null || true
+  }
+  trap cleanup EXIT
+  # Made under the trap, so an exit at any step of it leaves no job dir behind.
+  jobdir=$(mktemp -d /run/offload-job.XXXXXX)
+  root=$jobdir/root # dev's /, as the job sees it
+  # offload-bind walks rw/ and ro/ as the job's user, so the job dir may not be mktemp's 0700.
+  chmod 0755 "$jobdir"
+  mkdir "$root" "$jobdir/rw" "$jobdir/ro"
+  # A signal to the launcher itself (a kill, sshd stopping): the job stops with it, and
+  # once the control channel is open the wrapper is told so, rather than left to time out
+  # on its silence. Once the job half is reaped its end is known: a signal then stops
+  # nothing, and the launcher ignores it to report that end, clean up and exit with the
+  # job's code, which the wrapper checks against the status. Each step left is bounded.
+  # One pending as the reap returns runs this before the ignore below is set.
+  # shellcheck disable=SC2317,SC2329 # run by the trap
+  launcher_stopped() {
+    if [[ -n ${job_pid-} && ${ended-} == "$job_pid" ]]; then
+      trap '' HUP INT TERM
+      return
+    fi
+    if [[ -n ${channel_open-} ]]; then
+      # The monitor may be gone already (reaped, as when it ended first): under set -e a
+      # failed kill would exit here with no status sent.
+      [[ -z ${monitor_pid:-} ]] || { kill "$monitor_pid" 2>/dev/null || true; wait "$monitor_pid" 2>/dev/null || true; }
+      launcher_lost
+    fi
+    exit 143
+  }
+  trap launcher_stopped HUP INT TERM
+
+  # The control channel. The job does not start until the bridge has attached and the
+  # wrapper has answered `ready` with `go`.
+  install -d -m 0700 "$ctl_root"
+  mkdir -m 0700 "$ctl"
+  mkfifo "$ctl/in" "$ctl/out"
+  exec 3<>"$ctl/in" 4<>"$ctl/out"
+  channel_open=1
+  IFS= read -t 15 -r -u 3 line || exit 1
+  [[ $line == attached ]] || exit 1
+
+  # Without the job firewall (offload-net.nft) a job could reach this machine's own
+  # services: refuse before anything is set up, so the wrapper falls back.
+  nft list table inet offload_job >/dev/null 2>&1 || {
+    echo "offload-launch: the inet offload_job firewall table is missing" >&2
+    exit 1
+  }
+
+  # A slot, held through fd 7 until this process exits. The job's own processes do not
+  # inherit it (see 7>&- below), so only the launcher's life counts.
+  if [[ -n ${OFFLOAD_SLOTS:-} ]]; then
+    install -d -m 0700 "$slot_dir"
+    claimed=0
+    for ((i = 1; i <= OFFLOAD_SLOTS; i++)); do
+      exec 7>>"$slot_dir/$i"
+      if flock -n 7; then claimed=1; break; fi
+      exec 7>&-
+    done
+    ((claimed)) || { echo noslot >&4; exit 0; }
+  fi
+
+  # Ends the job when the wrapper is gone (`eof`, or no ping for $silence seconds), and
+  # forwards its signals to the job's process group (the job is the leader of its own,
+  # see setsid below), stopping the scope when the grace period after the first one ends.
+  # It also marks the job aborted: a scope not yet created cannot be killed, and the
+  # job checks the mark before it runs.
+  stop_scope() {
+    touch "$ctl/abort"
+    systemctl kill --signal=SIGKILL "$unit" 2>/dev/null || true
+  }
+  # The status the wrapper gets for a job stopped here. `unrun` while the job had not passed
+  # its wait for `go` (it marks `released` as it does), so the wrapper may still run it.
+  # systemd may not yet have handled the cgroup's OOM event when the job half exits, so a
+  # job killed by SIGKILL that no stop of ours explains waits up to a second for it.
+  oom_killed() {
+    local tries=1
+    if [[ ! -e $ctl/silent && ! -e $ctl/graced ]] && { (($1 == 137)) || [[ -s $ctl/signal && $(<"$ctl/signal") == 9 ]]; }; then tries=20; fi
+    while ((tries--)); do
+      [[ $(systemctl show -p Result --value "$unit" 2>/dev/null) != oom-kill ]] || return 0
+      ((tries == 0)) || sleep 0.05
+    done
+    return 1
+  }
+  # shellcheck disable=SC2329 # called by monitor and after the job
+  final_status() {
+    if [[ ! -e $ctl/released ]]; then
+      echo "status unrun"
+    elif oom_killed "$1"; then
+      echo "status oom-kill"
+    elif [[ -e $ctl/silent ]]; then
+      echo "status watchdog"
+    elif [[ -e $ctl/graced ]]; then
+      # Before the signal: the job's own process may have died by the forwarded signal
+      # while what it left behind outlived the grace.
+      echo "status graced"
+    elif [[ -s $ctl/signal ]]; then
+      echo "status signal $(<"$ctl/signal")"
+    elif [[ ! -s $ctl/started && -s $ctl/abort-sig ]]; then
+      # Signalled before the job started (the exec chain into offload-wait killed by the
+      # forwarded signal, or failing first): it ends as a local run stopped then would.
+      echo "status signal $(kill -l "$(head -n1 "$ctl/abort-sig")")"
+      rc=$((128 + $(kill -l "$(head -n1 "$ctl/abort-sig")")))
+    elif [[ ! -s $ctl/started ]] && (($1 != 125)); then
+      # The exec chain into offload-wait failed (nsenter, unshare, setpriv, offload-wait
+      # itself), past the ERR trap: its code is not the job's.
+      echo "offload-launch: starting the job failed (exit $1); the job did not run" >&2
+      echo "status exit 125"
+      rc=125 # the launcher exits with the code it reported, or the wrapper sees a cut stream
+    else
+      echo "status exit $1"
+    fi
+  }
+  # The launcher killed outright (SIGKILL) runs no trap: the monitor stops the job, does its
+  # cleanup and tells the wrapper, which would otherwise wait on the monitor's heartbeat
+  # for a status that never comes. In this subshell $$ is still the launcher's pid.
+  # shellcheck disable=SC2329 # called by monitor
+  launcher_lost() {
+    local released=1
+    stop_scope
+    for _ in $(seq 50); do
+      # `released` is read only once the scope is dead, as final_status does: read
+      # earlier, the job could mark it in between and be run again by the wrapper. A
+      # scope that will not die may have passed its wait, so it counts as released.
+      if ! systemctl is-active --quiet "$unit"; then
+        [[ -e $ctl/released ]] || released=0
+        break
+      fi
+      sleep 0.1
+    done
+    # Before cleanup removes $ctl: the bridge stops reading once it is gone.
+    if ((released)); then echo "status launcher-lost" >&4; else echo "status unrun" >&4; fi
+    cleanup
+  }
+  # shellcheck disable=SC2329 # run in the background below
+  monitor() {
+    exec 7>&- # the slot is the launcher's alone: it frees when the launcher exits
+    local line pend='' sig last=$SECONDS beat=-2 stop_at='' paused=0
+    while :; do
+      if ! kill -0 $$ 2>/dev/null; then launcher_lost; return; fi
+      # None while the wrapper is stopped: unread, they fill the channel in about 12 h and
+      # this write would block the monitor.
+      if ((!paused && SECONDS - beat >= 2)); then echo hb >&4; beat=$SECONDS; fi
+      # A timed-out read leaves the part of a record it got in $line: carried over, as
+      # the next read starts mid-record.
+      if ! IFS= read -t 1 -r -u 3 line; then
+        pend+=$line
+      else
+        line=$pend$line pend=''
+        last=$SECONDS
+        case $line in
+          eof) stop_scope; return ;;
+          go) touch "$ctl/go" ;;
+          "eow out" | "eow err")
+            # Recorded before it is sent, as abort-sig is. Only offload-wait, the job's init
+            # and the one child of the group's leader, is signalled: the job is not. Signal 63
+            # is its readerGoneSignal, not SIGPIPE, which Go may drop under the job half's ignore.
+            echo "${line#eow }" >>"$ctl/eow"
+            if [[ -s $ctl/pid ]]; then pkill --signal 63 -P "$(<"$ctl/pid")" 2>/dev/null || true; fi
+            ;;
+          "sig "*)
+            sig=${line#sig }
+            # Ctrl-Z on the wrapper: the job stops with it, and the wrapper, stopped, sends no
+            # ping, so the watchdog waits for the CONT. A dead wrapper still ends in `eof`.
+            if [[ $sig == TSTP || $sig == CONT ]]; then
+              # SIGSTOP, not TSTP: the job's group is an orphan (setsid), where the kernel
+              # discards a TSTP. $ctl/paused stops the job half's wait for `go` from timing
+              # out on a wrapper stopped before the job had a group to stop.
+              if [[ $sig == TSTP ]]; then paused=1 sig=STOP; touch "$ctl/paused"; else paused=0; rm -f "$ctl/paused"; fi
+              if [[ -s $ctl/pid ]]; then kill -s "$sig" -- "-$(<"$ctl/pid")" 2>/dev/null || true; fi
+              continue
+            fi
+            if [[ $sig == USR1 || $sig == USR2 ]]; then
+              # The job handles these and runs on: no abort, no grace.
+              if [[ -s $ctl/pid ]]; then kill -s "$sig" -- "-$(<"$ctl/pid")" 2>/dev/null || true; fi
+              continue
+            fi
+            [[ $sig == INT || $sig == TERM || $sig == HUP || $sig == QUIT ]] || continue
+            # Recorded before it is sent: offload-wait reads it in case the signal lands
+            # before its handlers do, which an init discards.
+            echo "$sig" >>"$ctl/abort-sig"
+            touch "$ctl/abort"
+            if [[ -s $ctl/pid ]]; then kill -s "$sig" -- "-$(<"$ctl/pid")" 2>/dev/null || true; fi
+            # In microseconds: SECONDS counts whole seconds, so SECONDS + grace can end up to
+            # a second early. EPOCHREALTIME's separator follows the locale; drop it.
+            : "${stop_at:=$((${EPOCHREALTIME//[!0-9]/} + grace * 1000000))}"
+            ;;
+        esac
+      fi
+      if [[ -n $stop_at ]] && ((${EPOCHREALTIME//[!0-9]/} >= stop_at)); then
+        if [[ -s $ctl/started && $(<"$ctl/started") == 12 ]]; then
+          # The job and all it left have ended (offload-wait wrote 2): what remains is its
+          # output's drain to a slow reader and the flush to dev, which a local run waits out.
+          stop_at=''
+        else
+          # Its SIGKILL takes offload-wait too, which would have recorded the signal.
+          if systemctl is-active --quiet "$unit"; then touch "$ctl/graced"; fi
+          stop_scope
+          return
+        fi
+      fi
+      if ((!paused && SECONDS - last >= silence)); then
+        # As for the grace: a job that already ended is reported as it ended.
+        if systemctl is-active --quiet "$unit"; then touch "$ctl/silent"; fi
+        stop_scope
+        return
+      fi
+    done
+  }
+  monitor &
+  monitor_pid=$!
+
+  # In the background, so a signal reaches the trap instead of waiting for the job.
+  # setsid makes the job the leader of a process group the control channel can signal.
+  # The braces keep bash's own "Killed" notice for a job that died by a signal off the
+  # job's stderr: the subshell's fd 2 is /dev/null, the command's is the saved one.
+  # An asynchronous group's own stdin is /dev/null, so the job's is saved on fd 6 first.
+  exec 6<&0
+  # Before= offload-cut.service: at shutdown that unit's stop cuts dev's NFS (--cut) first.
+  { systemd-run --quiet --scope --unit="$unit" -p Before=offload-cut.service \
+    -p CPUQuota="$cpu_quota" -p MemoryMax="$memory_max" -- \
+    setsid env OFFLOAD_JOB_DIR="$jobdir" OFFLOAD_CTL_DIR="$ctl" \
+    unshare --mount --ipc --propagation private -- "$0" "$@" <&6 6<&- 2>&5 5>&-; } 7>&- 5>&2 2>/dev/null &
+  exec 6<&-
+  job_pid=$!
+  ended=''
+  # bash's own "Killed" notice for a monitor that died by a signal would reach the job's stderr.
+  wait -n -p ended "$job_pid" "$monitor_pid" 2>/dev/null && st=0 || st=$?
+  if [[ $ended == "$job_pid" ]]; then
+    trap '' HUP INT TERM # the job's end is known: see launcher_stopped
+    rc=$st
+    # The monitor goes before the job's end is judged: until it is gone it may still reach
+    # the grace period's end and mark $ctl/graced.
+    kill "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+  else
+    # The monitor sends hb, reads the control channel and is the watchdog: once it is
+    # gone (killed, or done after stopping the scope) nothing else would stop the job,
+    # which goes on writing to dev over NFS with no wrapper. A monitor that stopped the
+    # job itself marked $ctl/abort first; one that died without doing so is part of the
+    # launcher lost.
+    [[ -e $ctl/abort ]] || monitor_lost=1
+    stop_scope
+    wait -p ended "$job_pid" && rc=0 || rc=$?
+    trap '' HUP INT TERM
+  fi
+  # The grace period's end and the watchdog mark the job while its scope is active, and the
+  # scope outlives the job by the launcher's own helpers in it: a job that ended by itself
+  # before the stop's SIGKILL took it keeps its own exit.
+  ((rc == 128 + 9)) || rm -f "$ctl/graced" "$ctl/silent"
+  # CPU the job's processes used: the launcher's waited-for children, cutime and cstime
+  # (fields 16 and 17 of /proc/<pid>/stat, in clock ticks; index 13 and 14 once the
+  # pid and command name are cut off).
+  stat=$(</proc/$$/stat)
+  read -ra stat <<<"${stat##*) }"
+  echo "cpu $(((stat[13] + stat[14]) * 1000 / $(getconf CLK_TCK)))" >&4
+  # Where the job left each output file it wrote itself, as offload-wait recorded it, so the
+  # wrapper leaves the caller's descriptor there.
+  if [[ -s $ctl/offsets ]]; then
+    while read -r stream n; do
+      if [[ $stream =~ ^(out|err)$ && $n =~ ^[0-9]+$ ]]; then echo "offset $stream $n" >&4; fi
+    done <"$ctl/offsets"
+  fi
+  if [[ -n ${monitor_lost-} && -e $ctl/released ]]; then
+    echo "status launcher-lost" >&4
+  else
+    final_status "$rc" >&4
+  fi
+  exit "$rc"
+fi
+
+# Job namespace, still root, still on the remote's root filesystem.
+root=$OFFLOAD_JOB_DIR/root rw=$OFFLOAD_JOB_DIR/rw ro=$OFFLOAD_JOB_DIR/ro
+dev=$1 uid=$2 gid=$3 groups=$4 cwd=$5 writable=$6 readonly_paths=$7 socks=$8
+shift 9 # the eight above and the --
+stdio=${OFFLOAD_STDIO:-} # read before the environment is replaced below
+umask_job=${OFFLOAD_UMASK:-} nofile=${OFFLOAD_NOFILE:-} rlimits=${OFFLOAD_RLIMITS:-}
+[[ $rlimits =~ ^([a-z]+=([0-9]+|unlimited)( |$))*$ ]] || { echo "offload-launch: OFFLOAD_RLIMITS is not name=value words" >&2; exit 2; }
+# The signals the caller left ignored (`trap '' TERM`, nohup), which a local command inherits.
+signal_opt=()
+if [[ -n ${OFFLOAD_IGNORE:-} ]]; then
+  [[ $OFFLOAD_IGNORE =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "offload-launch: OFFLOAD_IGNORE is not a signal list" >&2; exit 2; }
+  signal_opt=("--ignore-signal=$OFFLOAD_IGNORE")
+fi
+# And those it left blocked, which a local command inherits blocked.
+if [[ -n ${OFFLOAD_BLOCK:-} ]]; then
+  [[ $OFFLOAD_BLOCK =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "offload-launch: OFFLOAD_BLOCK is not a signal list" >&2; exit 2; }
+  signal_opt+=("--block-signal=$OFFLOAD_BLOCK")
+fi
+agent=${SSH_AUTH_SOCK:-} # the ssh-agent the wrapper forwarded to this machine, if any
+
+# This process is the job's: it becomes the command by exec, and setsid made it the leader
+# of its own process group, so the control channel signals the group by this pid.
+ctl=$OFFLOAD_CTL_DIR
+echo $$ >"$ctl/pid"
+# Signalled as the group's leader from here, it must live to see $ctl/abort, so a forwarded
+# signal does not kill it once `released` is out: each is ignored here (SIGINT too, which
+# a non-interactive bash leaves at its default). The helpers below keep the ignore: Go
+# resets all but SIGHUP and SIGINT to fatal at its start, so offload-bind and
+# offload-forward ignore them again, and offload-wait installs its handlers, which exec
+# resets for the job. A QUIT that lands in a helper before then gets the Go runtime's stack
+# dump on the job's stderr; no GOTRACEBACK setting stops it. RTMAX-1 (63) is offload-wait's
+# readerGoneSignal, sent to the leader's children, so a setup child running then (sleep,
+# mount) must not die of its default action.
+trap '' HUP INT TERM QUIT PIPE USR1 USR2 RTMAX-1
+
+# The block ends at an empty entry; what follows on stdin is the caller's, passed on to the
+# job (nothing, unless the wrapper was given --stdin). read takes one byte at a time from a
+# pipe, so it leaves that remainder alone.
+entries=()
+while IFS= read -r -d '' e && [[ -n $e ]]; do entries+=("$e"); done
+env_entries=(OFFLOAD_JOB=1) # a job's own offload call runs its command in place
+locale_entries=() # what env and prlimit, run as the caller, print their messages in
+for e in "${entries[@]}"; do
+  # The agent is rebound below; DBUS_* names a socket that does not exist here.
+  case $e in SSH_AUTH_SOCK=* | DBUS_*) ;; *) env_entries+=("$e") ;; esac
+  case $e in LANG=* | LANGUAGE=* | LC_*=*) locale_entries+=("$e") ;; esac
+done
+
+# setpriv takes no empty --groups list: a caller with no supplementary groups gets none.
+if [[ -n $groups ]]; then groups_opt=(--groups "$groups"); else groups_opt=(--clear-groups); fi
+
+mount -t nfs4 -o "ro,$nfs_opts" "$dev:/" "$root"
+
+# The writable paths come from a second, read-write mount of the export; the denied
+# paths inside them from a third, read-only one, bound over the top. The binds keep the
+# mounts alive once they are detached; the host side removes the empty mount points.
+mount -t nfs4 -o "rw,$nfs_opts" "$dev:/" "$rw"
+mount -t nfs4 -o "ro,$nfs_opts" "$dev:/" "$ro"
+# Dev exports /tmp beside /, so the client crosses into a filesystem of its own there
+# (on a lookup inside it: the trailing /. makes stat trigger the submount). Without that
+# export the job would write into the directory dev's /tmp hides: refuse, so the wrapper
+# runs the job locally.
+if [[ $(stat -c %d "$rw/tmp/.") == "$(stat -c %d "$rw")" ]]; then
+  echo "offload-launch: dev does not export /tmp; run apps/offload/install.sh on dev" >&2
+  exit 1
+fi
+# Every bind below is made by one offload-bind, in this order (a process per bind cost
+# 50 ms each): binds collects its arguments.
+binds=()
+while IFS= read -r p; do
+  [[ -n $p ]] && binds+=(--skip-missing --src-root "$rw" "$root" "$p")
+done <<<"$writable"
+while IFS= read -r p; do
+  [[ -n $p ]] && binds+=(--skip-missing --src-root "$ro" "$root" "$p")
+done <<<"$readonly_paths"
+
+# Tool caches live on this machine's disk: file locks do not work across NFS. They go
+# under the home of the user's passwd entry on dev, not the job's HOME: a caller that
+# set HOME elsewhere (a test's throwaway home) writes its caches to dev, as it would locally.
+# A line marked `ro` is bound read-only: what the job would write there (a container image)
+# would stay on this machine, never reach dev, so the write fails instead.
+home=$(awk -F: -v u="$uid" '$3 == u { print $6; exit }' "$root/etc/passwd")
+if [[ -n $home && -r $local_paths ]]; then
+  while IFS= read -r rel; do
+    [[ -z $rel || $rel == \#* ]] && continue
+    read_only=()
+    if [[ $rel == "ro "* ]]; then read_only=(--read-only) rel=${rel#ro }; fi
+    store=$local_store/$uid/${rel//\//%}
+    mkdir -p "$store"
+    chown "$uid:$gid" "$store"
+    binds+=(--skip-missing "${read_only[@]}" --src "$store" "$root" "$home/$rel")
+  done <"$local_paths"
+fi
+"$libexec/offload-bind" "$uid" "$gid" "$groups" "${binds[@]}"
+umount -l "$rw" "$ro"
+
+# An empty /run, but for the forwarded ssh-agent: the one socket a job may reach.
+mount -t tmpfs -o mode=755 tmpfs "$root/run"
+if [[ -S $agent ]]; then
+  touch "$root/run/ssh-agent.sock"
+  mount --bind "$agent" "$root/run/ssh-agent.sock"
+  env_entries+=(SSH_AUTH_SOCK=/run/ssh-agent.sock)
+fi
+
+# The job's network: a namespace of its own, joined to this machine by a veth pair, with
+# outbound access through the NAT that offload-net.nft sets up and no way to this
+# machine's own services (see that file). The namespace lives as long as the sleeper,
+# which dies with the job's scope, and the veth pair with it. NFS was mounted above, in
+# this machine's namespace, so file traffic does not cross the NAT. Veth plus NAT, not
+# pasta: run as root, pasta drops to nobody and cannot attach to the namespace, and with
+# `--runas 0` it ran the command in the host namespace.
+unshare --net sleep infinity &
+netpid=$!
+while [[ $(readlink "/proc/$netpid/ns/net") == "$(readlink /proc/self/ns/net)" ]]; do sleep 0.02; done
+netns=/proc/$netpid/ns/net
+slot=$(($$ % 16384))
+# The listing is read whole: `grep -q` leaving early would SIGPIPE ip, and under pipefail a
+# taken address would read as free.
+while [[ $(ip -4 -o addr show) == *" 10.200.$((slot * 4 / 256)).$((slot * 4 % 256 + 1))/30 "* ]]; do
+  slot=$(((slot + 1) % 16384))
+done
+gw_addr=10.200.$((slot * 4 / 256)).$((slot * 4 % 256 + 1))
+job_addr=10.200.$((slot * 4 / 256)).$((slot * 4 % 256 + 2))
+ip link add "offv$slot" type veth peer name eth0 netns "$netpid"
+ip addr add "$gw_addr/30" dev "offv$slot"
+ip link set "offv$slot" up
+# shellcheck disable=SC2016 # the script is for the inner sh
+nsenter --net="$netns" -- sh -c '
+  ip link set lo up
+  ip addr add "$1/30" dev eth0
+  ip link set eth0 up
+  ip route add default via "$2"' sh "$job_addr" "$gw_addr"
+
+# Dev's loopback services, answered on the job's loopback. The wrapper's ssh connection
+# carries each over a unix socket (-R); the forwarder, in this machine's mount namespace
+# so the sockets keep their paths, relays the job's 127.0.0.1:<port> to it.
+if [[ -n $socks ]]; then
+  # shellcheck disable=SC2086 # the sockets are a space-separated list
+  # setsid: a signal forwarded to the job's group must not end the relay during grace.
+  read -r _ < <(nsenter --mount=/proc/1/ns/mnt --net="$netns" -- setsid "$libexec/offload-forward" $socks)
+fi
+
+mount --rbind /proc "$root/proc"
+mount --rbind /sys "$root/sys"
+mount --rbind /dev "$root/dev"
+# /dev/shm and POSIX message queues of the job's own (this namespace's IPC namespace),
+# never the server's: podman keeps its locks in /dev/shm. The scope's MemoryMax caps both.
+mount -t tmpfs -o nosuid,nodev,mode=1777,size=50% tmpfs "$root/dev/shm"
+mount -t mqueue -o nosuid,nodev,noexec mqueue "$root/dev/mqueue"
+
+# A signal that arrived while the job was being set up cancels it.
+[[ ! -e $ctl/abort ]] || exit 130
+
+# Set up. The wrapper's `go` (the monitor in the host namespace turns it into $ctl/go)
+# releases the job; with none, `eof` or the watchdog stops the scope and the job never runs.
+# A wrapper that never answers (one from before the handshake) gets an exit before
+# `started`, so it falls back to a local run.
+echo ready >&4
+go_by=$((SECONDS + 30))
+until [[ -e $ctl/go ]]; do
+  [[ ! -e $ctl/abort ]] || exit 130
+  [[ ! -e $ctl/paused ]] || go_by=$((SECONDS + 30)) # a stopped wrapper sends no `go`
+  ((SECONDS < go_by)) || { echo "offload-launch: no go from the wrapper within 30 s; the job did not run" >&2; exit 1; }
+  sleep 0.05
+done
+# Past the wait: from here the job may run, and the launcher reports its status as the job's.
+touch "$ctl/released"
+
+# From here the wrapper reports the job's exit code as its own, so a failed step must say
+# that the job never ran, with a code no job's failure is mistaken for.
+trap 'echo "offload-launch: setting up the job failed at line $LINENO ($BASH_COMMAND); the job did not run" >&2; exit 125' ERR
+
+# The job's parent, opened now on fd 8 and run as /proc/self/fd/8: after the pivot the root
+# is dev's filesystem, and this machine's static binary starts from its own page cache
+# where an interpreter read from dev over NFS cost a third of a second per job. It writes the
+# signal the job died by, if any, to fd 9, for final_status, and reads from fd 10 each
+# signal the monitor forwarded to end the run, which may have landed before its handlers,
+# and from fd 11 each stream whose reader the wrapper lost. It writes to fd 12 where the job
+# left each output file it wrote itself, and to fd 13 once the job runs.
+exec 8<"$libexec/offload-wait"
+exec 9>"$ctl/signal"
+: >>"$ctl/abort-sig"
+exec 10<"$ctl/abort-sig"
+: >>"$ctl/eow"
+exec 11<"$ctl/eow"
+exec 12>"$ctl/offsets"
+exec 13>"$ctl/started"
+
+# pivot_root, not chroot: a chrooted process may not create user namespaces.
+cd "$root"
+pivot_root . .
+umount -l .
+
+# The caller's entries are not exported here: this shell, nsenter and setpriv run as root,
+# and an entry named uid, netns or LD_PRELOAD must reach none of them. The last step, which
+# runs as the caller, applies them as NAME=value arguments of `env -i`, so the job sees the
+# caller's environment exactly, not one a helper added LC_CTYPE or PWD to; a first `env -i`
+# gives that step the caller's locale alone, so a command it cannot start reads as on dev
+# (`env: ‘x’: No such file or directory`). setpriv's
+# --no-new-privs makes sudo, su or any setuid program fail loudly: run here as root it would
+# act on this machine, not on dev.
+for v in $(compgen -e); do unset "$v" 2>/dev/null || true; done
+
+# The wrapper already sent `go`, so it may not run the job itself from here whatever it
+# hears next. `started` marks the exec; the job gets neither end of the control channel.
+echo started >&4
+exec 3<&- 4>&-
+
+# The caller's umask, not sudo's.
+if [[ -n $umask_job ]]; then umask "$umask_job"; fi
+# The caller's soft limits (file size in bytes, which ulimit's blocks would round), each no
+# higher than this machine's hard one, which the job could not raise it past either, set
+# on the job alone: offload-wait needs descriptors of its own past a low open-file limit,
+# and its small writes must not die of SIGXFSZ.
+rlimit_opt=()
+if [[ -n $nofile ]]; then
+  hard=$(ulimit -Hn)
+  if [[ $hard != unlimited ]] && { [[ $nofile == unlimited ]] || ((nofile > hard)); }; then nofile=$hard; fi
+  rlimit_opt+=("--nofile=$nofile:")
+fi
+if [[ -n $rlimits ]]; then
+  declare -A hard_of=()
+  while read -r resource limit; do hard_of[${resource,,}]=$limit; done < <(/usr/bin/prlimit --pid $$ --raw --noheadings -o RESOURCE,HARD)
+  for word in $rlimits; do
+    name=${word%%=*} soft=${word#*=}
+    [[ -n ${hard_of[$name]:-} && $name != nofile ]] || { echo "offload-launch: this machine has no resource limit $name; the job did not run" >&2; exit 125; }
+    if [[ ${hard_of[$name]} != unlimited ]] && { [[ $soft == unlimited ]] || ((soft > hard_of[$name])); }; then soft=${hard_of[$name]}; fi
+    rlimit_opt+=("--$name=$soft:")
+  done
+fi
+# Set by prlimit in front of the job's command alone, never by `ulimit` here: `ulimit -f`
+# rounds to blocks, offload-wait's own writes must not die of SIGXFSZ, and an open-file
+# limit too low for offload-wait's own descriptors must still run the job.
+if ((${#rlimit_opt[@]})); then rlimit_opt=(/usr/bin/prlimit "${rlimit_opt[@]}" --); fi
+
+# offload-wait enters cwd after dropping privileges (dev's home is 0700 and root is
+# squashed), runs the job, and fails the run when the job's writes to dev did not land or
+# it left files in /dev/shm or /dev/mqueue, which end with it.
+# OFFLOAD_STDIO is the wrapper's stdio plan: `err merged` when the caller's stdout and
+# stderr are one file (a job that alternates between them then keeps its order), and a
+# `<stream> file …` line for each stream that is a regular file, which offload-wait opens on
+# dev for the job in place of relaying it.
+# The job gets a pid namespace and /proc of its own, with offload-wait as its init: a pid
+# read from dev (a pidfile) or a `pkill` names nothing on this machine, never another job
+# or the remote's own processes. unshare's parent stays in this process's place, the leader
+# of the job's process group, so it must outlive a signal forwarded to that group: it
+# inherits the ignores set above.
+if [[ $'\n'$stdio$'\n' == *$'\nerr merged\n'* ]]; then exec 2>&1; fi
+
+# env reads every word holding `=` as NAME=value, so a command whose path holds one
+# (`./dir=x/prog`) is started by sh's exec, which keeps the job's ignored and blocked
+# signals; the leading NAME=value words stay assignments. commandWords in batch.go is the
+# same rule for a local run.
+command_words=("$@")
+i=0
+while ((i < ${#command_words[@]})) && [[ ${command_words[i]} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do ((i += 1)); done
+if ((i < ${#command_words[@]})) && [[ ${command_words[i]} == *=* ]]; then
+  # shellcheck disable=SC2016 # sh expands it
+  command_words=("${command_words[@]:0:i}" /bin/sh -c 'exec "$0" "$@"' "${command_words[@]:i}")
+fi
+exec /usr/bin/nsenter --net="$netns" -- \
+  /usr/bin/unshare --pid --fork --mount-proc -- \
+  /usr/bin/setpriv --reuid "$uid" --regid "$gid" "${groups_opt[@]}" --no-new-privs -- \
+  /proc/self/fd/8 "$cwd" "$writable" $'/dev/shm\n/dev/mqueue' "$stdio" -- \
+  /usr/bin/env -i "${locale_entries[@]}" "${rlimit_opt[@]}" /usr/bin/env -i "${signal_opt[@]}" -- "${env_entries[@]}" "${command_words[@]}"

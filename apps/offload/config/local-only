@@ -1,0 +1,55 @@
+# Commands that stay on dev: watchers and servers, and what needs dev's display. Commands
+# that use a store kept on the remote's disk are config/remote-store-commands. One entry per
+# line: argv[0]'s basename, optionally followed by the arguments that must come next
+# (`cargo watch`).
+# Options may come before or between an entry's words (`cargo +nightly watch`, `hugo -D server`).
+# A package manager's dev, start, serve, watch or preview script, also as the first `:` or
+# `-` part of one, or watch as any part (`npm run dev`, `pnpm dev:web`, `npm run test:watch`,
+# `yarn workspace web dev`; not `build:dev`), a
+# task runner's task of exactly those names or with watch as a `-` part (`make build dev`, `just dev`, `deno task dev`,
+# `turbo dev`, `nx serve web`, `nx run-many -t serve`), a listed program it runs
+# (`npx vite`, `pnpm vite`, `uv run vite`, `uvx mkdocs serve`, `pipx run vite`, `python -m uvicorn`),
+# and any command given --watch, --watchAll, --watch-*, --hot, --reload or --serve (not
+# `=false`), or -w to tsc, rollup, webpack, mocha, vitest, tailwindcss, hugo or vite, match
+# without an entry
+# (watchServeMatch);
+# `vite build` and `vite optimize` do not match vite. A best effort: a
+# server or watcher it misses runs on the remote; `--where local` keeps one here.
+# `--where <host>` overrides this list.
+orca
+xvfb-run
+vite
+watch
+entr
+nodemon
+watchexec
+air
+inotifywait
+inotifywatch
+vitest watch
+vitest dev
+turbo watch
+hugo server
+hugo serve
+python -m http.server
+python3 -m http.server
+tsc-watch
+webpack-dev-server
+cargo watch
+next dev
+next start
+ng serve
+astro dev
+nuxt dev
+nuxi dev
+storybook dev
+gatsby develop
+remix dev
+mkdocs serve
+jekyll serve
+jekyll server
+jekyll s
+trunk serve
+deno serve
+uvicorn
+webpack serve
