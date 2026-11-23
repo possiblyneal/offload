@@ -1,0 +1,17 @@
+[Unit]
+Description=Network rules for offloaded jobs (NAT out, nothing in)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ExecStartPre=-/usr/sbin/nft delete table inet offload_job
+ExecStartPre=-/usr/sbin/nft delete table ip offload_nat
+ExecStart=/usr/sbin/nft -f /etc/offload/net.nft
+ExecStop=-/usr/sbin/nft delete table inet offload_job
+ExecStop=-/usr/sbin/nft delete table ip offload_nat
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Write the commit's Generated-By trailer at prepare-commit-msg, before
+# commitlint reads the message, and with --check at commit-msg refuse one
+# that names no model ID.
+#
+# A tool is not a co-author, but the model is worth keeping: it is the only
+# per-commit record of what produced the change. The model comes from outside
+# this repository, from an agent-side hook, by one of two routes.
+# CLAUDE_COMMIT_MODEL is the model ID exported into a git command, and wins
+# when set. Claude Code ignores an environment rewritten by a hook that grants
+# no permission (anthropics/claude-code#32060), so the hook also writes, for
+# each Bash command containing git, an entry under
+# ${XDG_CACHE_HOME:-~/.cache}/claude-commit-model/<session id>/ holding the
+# model ID, a newline, then the exact command.
+#
+# The entry is per command because subagents share their parent's session ID
+# and nothing else identifying them reaches the shell: one file per session
+# let parallel agents on different models cross-attribute. So this finds the
+# Bash tool's shell, the ancestor whose parent is CLAUDE_PID, and takes the
+# model from the entries whose command that shell is running. Claude Code runs
+# each command as `bash -c "... && eval '<command>' && ..."`, with each ' in
+# it written '"'"'; an entry matches when that shell's command line contains
+# its command quoted the same way, closing quote included, so `git commit`
+# does not match `git commit --amend`. Matches naming different models, or a
+# change to that wrapper, insert nothing rather than guess.
+#
+# When the message has no Generated-By trailer, this inserts one from
+# whichever source it finds. With neither the author writes the trailer. An
+# --amend run by an agent is stamped like any other commit, making the agent
+# its author of record.
+#
+# A Co-Authored-By addressed to noreply@anthropic.com, from habit or with
+# Claude Code's git instructions on, gives way to the model ID when one is
+# known and otherwise becomes a Generated-By with the address dropped: it
+# exists so GitHub can attribute a Co-Authored-By to an account, which does not
+# apply to a Generated-By naming a model. A human co-author keeps their line.
+#
+# Without a model from either source nothing is inserted. A commit made
+# outside Claude Code carries no trailer unless its author writes one, and
+# `trailer-exists` in .commitlintrc.yaml refuses it: a script that supplied
+# the trailer unconditionally would leave that rule reporting a record nothing
+# made.
+#
+# Nor is anything inserted while a rebase or cherry-pick replays commits: git
+# runs this hook for each one, and stamping them would name the session's model
+# on commits it did not write.
+#
+# An empty message gains the trailer like any other, so git does not abort it;
+# commitlint refuses it instead, since its header is then the trailer line and
+# has no conventional type. The hook runs before the editor opens and cannot
+# tell an empty message from one about to be written.
+#
+# pre-commit passes the message file as the first argument at this stage. The
+# other two arguments Git supplies -- the source and the commit object -- are
+# not read: the in-progress state above is what tells a replay apart.
+
+check=""
+if [[ "${1:-}" == --check ]]; then
+  check=1
+  shift
+fi
+
+msg_file="${1:-}"
+[[ -n "$msg_file" && -f "$msg_file" ]] || exit 0
+
+replaying() {
+  local path
+  for path in rebase-merge rebase-apply CHERRY_PICK_HEAD; do
+    [[ -e "$(git rev-parse --git-path "$path" 2>/dev/null)" ]] && return 0
+  done
+  return 1
+}
+
+# Asks what `trailer-exists` will see: commitlint runs this same parse and
+# matches the key case-sensitively, so a Generated-By line in the body, or one
+# spelled in lowercase, does not count.
+attributed() {
+  git interpret-trailers --parse "$msg_file" | grep -q '^Generated-By:'
+}
+
+# Prints the PID of the Bash tool's shell running this commit -- the ancestor
+# whose parent is Claude Code -- or nothing.
+#
+# Each step reads /proc/<pid>/stat in-process where it exists: a ps per step
+# cost about 20ms of CPU, paid by every commit, and a test suite making
+# hundreds of commits spent more on this walk than on its tests. The parent is
+# the second field after comm, found after the last ") " since comm is
+# parenthesized and may itself contain ") " or a newline; the whole file is
+# read, so a newline cannot cut it short. macOS has no /proc and keeps ps.
+claude_shell() {
+  local claude="${CLAUDE_PID:-}" pid=$$ parent stat steps
+  [[ "$claude" =~ ^[0-9]+$ ]] || return 0
+  for (( steps = 0; steps < 32; steps++ )); do
+    if [[ -r /proc/$$/stat ]]; then
+      stat=
+      read -r -d '' stat 2>/dev/null < "/proc/$pid/stat" || [[ -n "$stat" ]] || return 0
+      stat="${stat##*) }"
+      stat="${stat#* }"
+      parent="${stat%% *}"
+    else
+      parent="$(ps -o ppid= -p "$pid" 2>/dev/null)" || return 0
+      parent="${parent//[[:space:]]/}"
+    fi
+    if [[ "$parent" == "$claude" ]]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+    [[ "$parent" =~ ^[0-9]+$ && "$parent" != 0 ]] || return 0
+    pid="$parent"
+  done
+}
+
+# Prints the model the session's entries record for the command line given,
+# or nothing when none matches or matches disagree. The session ID is joined
+# into a path, so only a plain ID is read; anything with a slash or dot could
+# climb out of the cache directory. Each read appends an x and strips it,
+# since command substitution would otherwise drop trailing newlines and an
+# exact match needs them.
+matching_model() {
+  local cmdline="$1" sid="${CLAUDE_CODE_SESSION_ID:-}"
+  [[ "$sid" =~ ^[A-Za-z0-9-]+$ ]] || return 0
+  local entry content cmd quoted name found=""
+  for entry in "${XDG_CACHE_HOME:-$HOME/.cache}/claude-commit-model/$sid"/*; do
+    [[ -f "$entry" ]] || continue
+    content="$(cat "$entry"; printf x)"
+    content="${content%x}"
+    [[ "$content" == *$'\n'* ]] || continue
+    cmd="${content#*$'\n'}"
+    quoted="${cmd//\'/\'\"\'\"\'}"
+    [[ "$cmdline" == *"eval '$quoted'"* ]] || continue
+    name="${content%%$'\n'*}"
+    [[ -n "$name" && ( -z "$found" || "$name" == "$found" ) ]] || return 0
+    found="$name"
+  done
+  printf '%s' "$found"
+}
+
+# Prints the model recorded for the command this commit runs under, or
+# nothing. /proc keeps a multi-line command intact; ps may not, which then
+# matches nothing and leaves commitlint to refuse the commit.
+session_model() {
+  local shell cmdline
+  shell="$(claude_shell)"
+  [[ -n "$shell" ]] || return 0
+  if [[ -r "/proc/$shell/cmdline" ]]; then
+    cmdline="$(tr '\0' ' ' < "/proc/$shell/cmdline"; printf x)"
+  else
+    cmdline="$(ps -ww -o args= -p "$shell"; printf x)"
+  fi
+  matching_model "${cmdline%x}"
+}
+
+# --check, at commit-msg: a Generated-By trailer must name a model ID. The
+# record is only worth keeping if it can be searched, and hand-typed trailers
+# drifted into display names -- `Claude Opus 5.5`, `Opus 5`, `Claude Opus 5.5
+# (1M context)` -- beside the IDs, a dozen spellings for a handful of models.
+# What is checked is the shape of any vendor's ID, one word with no [suffix],
+# not a list of Claude models, which would refuse the next one; `qwen3-coder:30b`
+# and `...@20250805` pass, and nothing asks whether the model exists. A missing
+# trailer is left to commitlint's `trailer-exists`, which skips the merge,
+# revert, and fixup subjects on its default ignore list where this could not.
+# Replayed commits are passed: they keep the trailer they were written with.
+if [[ -n "$check" ]]; then
+  replaying && exit 0
+  while IFS= read -r value; do
+    if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]*$ ]]; then
+      echo "Generated-By: '$value' is not a model ID. Write the ID, one word" >&2
+      echo "with no [suffix], e.g. 'Generated-By: claude-opus-5-5'." >&2
+      exit 1
+    fi
+  done < <(git interpret-trailers --parse "$msg_file" | sed -n 's/^Generated-By:[[:space:]]*//p')
+  exit 0
+fi
+
+# A context-window suffix such as [1m] is a setting, not part of the model ID.
+model="${CLAUDE_COMMIT_MODEL:-}"
+[[ -n "$model" ]] || model="$(session_model)"
+model="${model%%\[*}"
+
+# Claude Code's own Co-Authored-By names the model by display name. Where the
+# ID is known it replaces that line, being the same fact in a form that can be
+# searched; otherwise the line becomes a Generated-By naming what it named,
+# spelled as an ID so --check accepts it: lowercased, a parenthetical such as
+# `(1M context)` dropped, spaces and dots made hyphens, and a hyphen left at
+# either end trimmed, which turns `Claude Opus 5.5` into `claude-opus-5-5`.
+co_author='^[Cc]o-[Aa]uthored-[Bb]y:[[:space:]]*(.+)[[:space:]]+<noreply@anthropic\.com>[[:space:]]*$'
+if [[ -n "$model" ]] && ! replaying; then
+  sed -i -E "/$co_author/d" "$msg_file"
+else
+  sed -i -E "/$co_author/{
+    s/$co_author/\1/
+    s/[[:space:]]*\([^)]*\)//g
+    s/[[:space:].]+/-/g
+    s/^-+|-+$//g
+    y/ABCDEFGHIJKLMNOPQRSTUVWXYZ/abcdefghijklmnopqrstuvwxyz/
+    s/^/Generated-By: /
+  }" "$msg_file"
+fi
+
+# --if-exists add, because git compares keys case-insensitively and would
+# otherwise treat a lowercase trailer as this one and skip it. --no-divider
+# keeps a `---` body line from pulling the trailer up mid-message; commitlint,
+# whose parse stops at that line, then refuses the commit rather than
+# accepting a trailer buried in the body.
+if [[ -n "$model" ]] && ! attributed && ! replaying; then
+  git interpret-trailers --in-place --no-divider --if-exists add \
+    --trailer "Generated-By: $model" "$msg_file"
+fi

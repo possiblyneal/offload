@@ -1,0 +1,9 @@
+# Copy to offload.conf and replace both documentation addresses before installing.
+# The address remotes mount the initiating machine's filesystem from.
+# dev 192.0.2.50
+
+# The NFS export admits exactly the configured remote addresses.
+# remote server 192.0.2.10
+
+# Jobs a remote accepts at once; unset means 1.
+# slots server 2

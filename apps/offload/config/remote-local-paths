@@ -1,0 +1,12 @@
+# Paths under the job user's home kept on the remote's own disk instead of dev's, one
+# per line. File locks do not work between dev and an NFS client, so a shared tool cache
+# would corrupt. A path missing on dev is skipped. Kept per user and reused between jobs.
+# `ro <path>` binds it read-only: what a job writes there would stay on the remote, never
+# reach dev (a container image), so the write fails with EROFS instead.
+.cache/go-build
+go/pkg/mod
+.cache/uv
+.cache/pre-commit
+ro .local/share/containers
+ro .cache/containers
+.cache/Microsoft

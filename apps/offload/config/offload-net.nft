@@ -1,0 +1,27 @@
+# Network for offloaded jobs on a remote. Each job has a network namespace joined to the
+# host by a veth pair named offv<N>, with a /30 inside 10.200.0.0/16. A job may go out
+# (masqueraded) and nowhere else, a refusal answered at once rather than left to time out: its packets never reach this machine's own services,
+# its containers, or another job. Loaded by offload-net.service.
+table inet offload_job {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "offv*" reject
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    # A published container port is a forward through DNAT, not an input.
+    iifname "offv*" ct status dnat reject
+    # Containers are masqueraded as this machine and keep privileged source ports, which
+    # dev's export (sec=sys) trusts. This machine's own NFS client sends from the output
+    # hook, never through here.
+    tcp dport 2049 reject with tcp reset
+    iifname "offv*" oifname { "podman*", "docker*", "br-*", "offv*", "lo" } reject
+  }
+}
+
+table ip offload_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 10.200.0.0/16 oifname != "offv*" masquerade
+  }
+}
