@@ -315,10 +315,10 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 
 - `offload health [--notify]` (`health.go`) runs `hostname` through `--where <remote>` on
   each remote in file order. Each probe uses a private directory on the `/tmp` export,
-  a clean environment with the SSH agent preserved, and its own decisions log. The probe
-  does not depend on the caller's home or state mount. Health then reads the real jobs
-  that ended since its last run (30
-  min with no state) and prints the verdict, `assess`'s, pure and table-tested:
+  a clean environment with the SSH agent and nested-job guard preserved, and its own decisions log.
+  A relative agent socket uses a short symlink beside the probe cwd, so OpenSSH can reach the
+  original socket without the placement checks walking that link. Health then reads the jobs
+  that ended since its last run (30 min with no state) and prints the verdict:
 
   - `fail`: a remote did not take the test job (`judgeProbe`: it ran on dev for any rule
     but `no-free-slot` or `jobs-lock`, carried a fault, failed, or left no record);

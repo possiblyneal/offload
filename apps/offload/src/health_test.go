@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,20 +10,44 @@ import (
 )
 
 func TestProbeDoesNotInheritCallerPaths(t *testing.T) {
+	// The listener itself needs a short address even when the runner's TMPDIR is deep.
+	t.Setenv("TMPDIR", "/tmp")
 	root := t.TempDir()
+	state := filepath.Join(root, strings.Repeat("x", 110))
 	t.Setenv("OFFLOAD_TEST_UNEXPORTED", root)
-	wrapper := filepath.Join(root, "wrapper")
+	t.Setenv("SSH_AUTH_SOCK", "link/../agent.sock")
+	t.Setenv("OFFLOAD_JOB", "1")
+	target := filepath.Join(root, "nested")
+	for _, dir := range []string{state, target} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(target, filepath.Join(state, "link")); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", filepath.Join(root, "agent.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	wrapper := filepath.Join(state, "wrapper")
 	if err := os.WriteFile(wrapper, []byte(`#!/bin/sh
 set -eu
 [ "${OFFLOAD_TEST_UNEXPORTED-unset}" = unset ]
 [ "$HOME" = "$PWD" ]
 [ "${OFFLOAD_DECISIONS_LOG%/*}" = "$PWD" ]
 [ "$PWD" != "${0%/*}" ]
+[ "${#SSH_AUTH_SOCK}" -lt 108 ]
+[ "${SSH_AUTH_SOCK%/*}" != "$PWD" ]
+[ -S "$SSH_AUTH_SOCK" ]
+[ "$SSH_AUTH_SOCK" -ef "${0%/*}/link/../agent.sock" ]
+[ "$OFFLOAD_JOB" = 1 ]
 printf '{"placement":"worker"}\n' > "$OFFLOAD_DECISIONS_LOG"
 `), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if got := runProbe(wrapper, "worker"); got != (probe{remote: "worker"}) {
+	if got := runProbe(wrapper, state, "worker"); got != (probe{remote: "worker"}) {
 		t.Fatalf("probe = %+v", got)
 	}
 }
