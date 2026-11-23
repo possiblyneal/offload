@@ -100,16 +100,44 @@ func byRemote(m map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// runProbe runs `hostname` through offload on remote, from dir (offload's state folder: on
-// dev's disk, so exported, and small, so its link scan finishes) with no display, logging
-// its record to a file of its own, and judges it.
-func runProbe(self, dir, remote string) probe {
-	log := filepath.Join(dir, "probe-"+remote+".log")
-	_ = os.Remove(log)
-	defer os.Remove(log)
+// runProbe runs hostname through normal placement from a private directory on the /tmp
+// export. The caller's cwd, state and environment may name mounts the worker cannot see.
+func runProbe(self, state, remote string) probe {
+	dir, err := os.MkdirTemp("/tmp", "offload-health-")
+	if err != nil {
+		return probe{remote, err.Error()}
+	}
+	defer os.RemoveAll(dir)
+	cwd := filepath.Join(dir, "job")
+	if err := os.Mkdir(cwd, 0700); err != nil {
+		return probe{remote, err.Error()}
+	}
+	log := filepath.Join(cwd, "probe.log")
 	cmd := exec.Command(self, "--where", remote, "--", "hostname")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "DISPLAY=", "WAYLAND_DISPLAY=", logOverride+"="+log)
+	cmd.Dir = cwd
+	cmd.Env = []string{"HOME=" + cwd, "PATH=/usr/bin:/bin", logOverride + "=" + log}
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if !filepath.IsAbs(sock) {
+			// Keep the old cwd without cleaning the socket path: a symlink can precede "..".
+			if !filepath.IsAbs(state) {
+				cwd, err := os.Getwd()
+				if err != nil {
+					return probe{remote, err.Error()}
+				}
+				state = cwd + string(os.PathSeparator) + state
+			}
+			// Keep the alias outside the job tree: placement checks links in that tree.
+			alias := filepath.Join(dir, "agent.sock")
+			if err := os.Symlink(state+string(os.PathSeparator)+sock, alias); err != nil {
+				return probe{remote, err.Error()}
+			}
+			sock = alias
+		}
+		cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+sock)
+	}
+	if nested, ok := os.LookupEnv("OFFLOAD_JOB"); ok {
+		cmd.Env = append(cmd.Env, "OFFLOAD_JOB="+nested)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	runErr := ""

@@ -314,10 +314,11 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 ### Health
 
 - `offload health [--notify]` (`health.go`) runs `hostname` through `--where <remote>` on
-  each remote in file order, from the state folder (exported, and small enough for the link
-  scan), each logging to a file of its own through `OFFLOAD_DECISIONS_LOG`, so test jobs
-  never reach the decisions log. It then reads the jobs that ended since its last run (30
-  min with no state) and prints the verdict, `assess`'s, pure and table-tested:
+  each remote in file order. Each probe uses a private directory on the `/tmp` export,
+  a clean environment with the SSH agent and nested-job guard preserved, and its own decisions log.
+  A relative agent socket uses a short symlink beside the probe cwd, so OpenSSH can reach the
+  original socket without the placement checks walking that link. Health then reads the jobs
+  that ended since its last run (30 min with no state) and prints the verdict:
 
   - `fail`: a remote did not take the test job (`judgeProbe`: it ran on dev for any rule
     but `no-free-slot` or `jobs-lock`, carried a fault, failed, or left no record);
@@ -688,6 +689,9 @@ Accepted limits of signals:
   `cmd/offload-wait/main.go` uses from their source, so a word added on one side alone fails there;
   `signals_test.go` runs the launcher's own command-start block against `commandWords`'
   table.
+- Unit tests that need to reach the symlink or lock checks can use `testUnexportedMounts`
+  to model an exported workspace and `/tmp` with a private `/dev/shm`. They still exercise
+  real links and locks; `mounts_test.go` tests the mount classification separately.
 
 - `scripts/integration` runs `tests/integration/`: each case runs one command locally
   and through `offload --where server`, then compares exit code, stdout, stderr and the
