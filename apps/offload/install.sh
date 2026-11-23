@@ -137,6 +137,7 @@ done
 mkdir -p "$HOME/.local/bin"
 (cd "$UNIT/src" && go build -ldflags "-X main.configDir=$UNIT/config" -o "$HOME/.local/bin/offload" .)
 echo "offload: installed $HOME/.local/bin/offload"
+install -Dm0644 "$UNIT/scripts/auto.bash" "$HOME/.local/share/offload/auto.bash"
 
 # dev: the health check, every 30 minutes, reporting to the homelab panel. Copied, as the
 # command is, so the timer never runs units from a checkout that may be removed.

@@ -19,7 +19,8 @@ refuse_while_jobs "not uninstalling"
 
 systemctl --user disable --now offload-health.timer >/dev/null 2>&1 || true
 SYSTEMD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-rm -f "$HOME/.local/bin/offload" "$SYSTEMD/offload-health.service" "$SYSTEMD/offload-health.timer"
+rm -f "$HOME/.local/bin/offload" "$HOME/.local/share/offload/auto.bash" \
+  "$SYSTEMD/offload-health.service" "$SYSTEMD/offload-health.timer"
 systemctl --user daemon-reload
 
 sudo rm -f /etc/exports.d/offload.exports /etc/nfs.conf.d/offload.conf /etc/systemd/system/nfs-server.service.d/offload.conf

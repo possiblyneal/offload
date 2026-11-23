@@ -304,12 +304,19 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   remotely, failures (non-zero exits, 255 being lost contact) by placement, and the mean
   `cpu_pressure_avg10` of local runs. `summarise` is pure; `--since` is the only flag.
 
-- `apps/claude-user-level/src/rules/offload.md` tells agents to prefix `offload --` to
-  builds, tests and replays over about 30 s of CPU that no runner already offloads. Heavy
-  runners call `offload` themselves; the gate (`scripts/check`, `scripts/ci`) does not, so
-  it never depends on the server. Adopted runner: `apps/session-review/src/review.py` runs
-  `scan.py` through `offload` when `~/.local/bin/offload` exists. Other repositories'
-  runners are tracked as `offload: adopt in <repo> <runner>` issues.
+### Automatic routing in Bash
+
+- `install.sh` copies `scripts/auto.bash` to `~/.local/share/offload/auto.bash`;
+  `uninstall.sh` removes it. To opt in, source it from the Bash startup file used by
+  your terminal, guarded by a file-exists check. Claude Code agent shells can source it
+  through `CLAUDE_ENV_FILE` in a `SessionStart` hook. Install does not edit startup files.
+- The shell routes direct `go build` and `go test` through the existing Offload command
+  with no keyboard input. It passes through redirected input, custom executors, custom
+  test arguments, explicit output flags and nonempty `GOFLAGS`. Use `command go` for a job that needs the local
+  terminal, or `OFFLOAD_AUTO=0` to disable automatic routing.
+- The Bash function is not exported. Other commands, scripts (including `scripts/check`
+  and `scripts/ci`), and explicit `offload --` calls keep their existing behavior. A runner
+  such as `apps/session-review/src/review.py` may still call Offload itself.
 
 ### Health
 
