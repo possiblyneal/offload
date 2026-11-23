@@ -314,9 +314,10 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 ### Health
 
 - `offload health [--notify]` (`health.go`) runs `hostname` through `--where <remote>` on
-  each remote in file order, from the state folder (exported, and small enough for the link
-  scan), each logging to a file of its own through `OFFLOAD_DECISIONS_LOG`, so test jobs
-  never reach the decisions log. It then reads the jobs that ended since its last run (30
+  each remote in file order. Each probe uses a private directory on the `/tmp` export,
+  a clean environment with the SSH agent preserved, and its own decisions log. The probe
+  does not depend on the caller's home or state mount. Health then reads the real jobs
+  that ended since its last run (30
   min with no state) and prints the verdict, `assess`'s, pure and table-tested:
 
   - `fail`: a remote did not take the test job (`judgeProbe`: it ran on dev for any rule

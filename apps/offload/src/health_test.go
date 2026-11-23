@@ -1,10 +1,31 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestProbeDoesNotInheritCallerPaths(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OFFLOAD_TEST_UNEXPORTED", root)
+	wrapper := filepath.Join(root, "wrapper")
+	if err := os.WriteFile(wrapper, []byte(`#!/bin/sh
+set -eu
+[ "${OFFLOAD_TEST_UNEXPORTED-unset}" = unset ]
+[ "$HOME" = "$PWD" ]
+[ "${OFFLOAD_DECISIONS_LOG%/*}" = "$PWD" ]
+[ "$PWD" != "${0%/*}" ]
+printf '{"placement":"worker"}\n' > "$OFFLOAD_DECISIONS_LOG"
+`), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := runProbe(wrapper, "worker"); got != (probe{remote: "worker"}) {
+		t.Fatalf("probe = %+v", got)
+	}
+}
 
 func TestAssess(t *testing.T) {
 	since := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
