@@ -16,6 +16,16 @@ import (
 	"time"
 )
 
+// testUnexportedMounts models an exported workspace and /tmp, with /dev/shm private.
+func testUnexportedMounts() []string { return []string{"/dev/shm"} }
+
+func useTestMounts(t *testing.T) {
+	t.Helper()
+	original := devMounts
+	t.Cleanup(func() { devMounts = original })
+	devMounts = testUnexportedMounts
+}
+
 // TestMain runs `offload` itself when OFFLOAD_TEST_RUN holds its arguments, joined by
 // \x1f, so a test can watch a run that ends in exec.
 func TestMain(m *testing.M) {
@@ -63,6 +73,9 @@ func TestMain(m *testing.M) {
 	}
 	if args := os.Getenv("OFFLOAD_TEST_RUN"); args != "" {
 		configDir = cmp.Or(os.Getenv("OFFLOAD_TEST_CONFIG"), configDir)
+		if os.Getenv("OFFLOAD_TEST_MOUNTS") == "1" {
+			devMounts = testUnexportedMounts
+		}
 		os.Exit(run(strings.Split(args, "\x1f")))
 	}
 	os.Exit(m.Run())
@@ -490,7 +503,7 @@ func TestAnOutputFileAnotherProcessLocksKeepsTheJobHere(t *testing.T) {
 	out.Close()
 	var stderr bytes.Buffer
 	cmd := exec.Command("sh", "-c", `exec "$0" >"$1"`, os.Args[0], out.Name())
-	cmd.Env = append(os.Environ(), "HOME="+home, "OFFLOAD_TEST_CONFIG="+config,
+	cmd.Env = append(os.Environ(), "HOME="+home, "OFFLOAD_TEST_CONFIG="+config, "OFFLOAD_TEST_MOUNTS=1",
 		"OFFLOAD_TEST_RUN="+strings.Join([]string{"--", "true"}, "\x1f"))
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

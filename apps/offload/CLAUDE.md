@@ -688,6 +688,9 @@ Accepted limits of signals:
   `cmd/offload-wait/main.go` uses from their source, so a word added on one side alone fails there;
   `signals_test.go` runs the launcher's own command-start block against `commandWords`'
   table.
+- Unit tests that need to reach the symlink or lock checks can use `testUnexportedMounts`
+  to model an exported workspace and `/tmp` with a private `/dev/shm`. They still exercise
+  real links and locks; `mounts_test.go` tests the mount classification separately.
 
 - `scripts/integration` runs `tests/integration/`: each case runs one command locally
   and through `offload --where server`, then compares exit code, stdout, stderr and the

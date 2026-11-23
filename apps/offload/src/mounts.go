@@ -130,7 +130,7 @@ func onRootFS(binds [][2]string, p string) string {
 
 // devMounts is unexportedMounts of this process's mount table, or none when it cannot be
 // read.
-func devMounts() []string {
+var devMounts = func() []string {
 	f, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
 		return nil

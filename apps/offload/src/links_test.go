@@ -171,6 +171,7 @@ func TestReadLinkDirSkipsADirectoryOnAnotherDevice(t *testing.T) {
 
 // gatherFacts refuses a job whose cwd offload cannot walk for links.
 func TestGatherFactsRefusesACwdItCannotWalkForLinks(t *testing.T) {
+	useTestMounts(t)
 	cwd := outsideTmp(t)
 	if err := os.MkdirAll(filepath.Join(cwd, "a/b/c"), 0o755); err != nil {
 		t.Fatal(err)
