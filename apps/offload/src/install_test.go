@@ -509,3 +509,32 @@ func exitStatus(t *testing.T, err error) int {
 	t.Fatal(err)
 	return 0
 }
+
+func TestExportOnlyChecksUnambiguousScopedMetadata(t *testing.T) {
+	for _, c := range []struct {
+		name, flags string
+		allow       bool
+	}{
+		{"first", "-X main.scopedExportRoot=/run/offload-export -X main.configDir=/fixture", true},
+		{"duplicate empty", "-X main.configDir=/fixture -X main.scopedExportRoot=/run/offload-export -X main.scopedExportRoot=", false},
+		{"duplicate same", "-X main.scopedExportRoot=/run/offload-export -X main.scopedExportRoot=/run/offload-export", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			bin, log := fakeInstallTools(t)
+			root, home := t.TempDir(), t.TempDir()
+			wrapper := filepath.Join(home, ".local/bin/offload")
+			if err := os.MkdirAll(filepath.Dir(wrapper), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(wrapper, []byte("build\t-ldflags=\""+c.flags+"\"\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(filepath.Join(installFixture(t), "install.sh"), "--export-only")
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+home, "FAKE_SSH=idle", "FAKE_LOG="+log, "FAKE_ROOT="+root)
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != c.allow {
+				t.Errorf("exit %v output %s, want allow %v", err, out, c.allow)
+			}
+		})
+	}
+}

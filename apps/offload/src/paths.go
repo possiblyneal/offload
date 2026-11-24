@@ -338,6 +338,7 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 		return ""
 	}
 	home := scriptHome(env)
+	overriddenGoEnv := map[string]bool{}
 	if view.root != "" && findCommand(argv, func(cmd []string) string {
 		if filepath.Base(cmd[0]) == "go" {
 			return "go"
@@ -345,6 +346,7 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 		return ""
 	}) != "" {
 		var goenv, xdg string
+		goHome := home
 		for _, entry := range env {
 			name, value, _ := strings.Cut(entry, "=")
 			switch name {
@@ -354,17 +356,41 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 				xdg = value
 			}
 		}
+		words := argv
+		for len(words) > 0 && isAssignment(words[0]) {
+			name, value, _ := strings.Cut(words[0], "=")
+			switch name {
+			case "GOENV":
+				goenv = value
+				overriddenGoEnv[name] = true
+			case "XDG_CONFIG_HOME":
+				xdg = value
+				overriddenGoEnv[name] = true
+			case "HOME":
+				goHome = value
+				overriddenGoEnv[name] = true
+			}
+			words = words[1:]
+		}
+		if len(words) == 0 || filepath.Base(words[0]) != "go" {
+			return "cannot determine the Go command's configuration or working directory"
+		}
 		if goenv == "" {
 			if xdg == "" {
-				xdg = filepath.Join(home, ".config")
+				xdg = filepath.Join(goHome, ".config")
 			}
 			goenv = filepath.Join(xdg, "go", "env")
 		}
 		if goenv != "off" {
+			if !filepath.IsAbs(goenv) {
+				goenv = filepath.Join(cwd, goenv)
+			}
 			if _, err := os.Stat(goenv); err == nil {
 				if reason := check("Go configuration", goenv); reason != "" {
 					return reason
 				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return "cannot inspect Go configuration " + goenv
 			}
 		}
 	}
@@ -403,6 +429,9 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 	}
 	for _, e := range env {
 		name, v, _ := strings.Cut(e, "=")
+		if overriddenGoEnv[name] {
+			continue
+		}
 		if name == "TMPDIR" {
 			p := v
 			if p != "" && !filepath.IsAbs(p) {

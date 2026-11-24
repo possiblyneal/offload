@@ -20,11 +20,34 @@ esac
 . "$UNIT/scripts/remotes.sh"
 read_remotes "$CONF" "nothing installed"
 
-# An export-only migration must not strand an installed legacy wrapper. Build metadata
-# identifies the scoped root baked in by a full install; unknown builds fail closed.
+# An export-only migration must not strand an installed legacy wrapper. Accept only
+# unambiguous linker metadata; never execute the wrapper to inspect it.
+scoped_wrapper() {
+  local metadata line flags='' token next=0 count=0 flag_lines=0
+  local -a words
+  metadata=$(go version -m "$HOME/.local/bin/offload" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]*build[[:space:]]+-ldflags=\"([^\"]*)\"$ ]]; then
+      ((flag_lines += 1))
+      [[ $flag_lines == 1 ]] || return 1
+      flags=${BASH_REMATCH[1]}
+    elif [[ $line == *-ldflags=* ]]; then
+      return 1
+    fi
+  done <<<"$metadata"
+  [[ -n $flags && $flags != *\\* && $flags != *\'* && $flags != *\"* ]] || return 1
+  read -r -a words <<<"$flags"
+  for token in "${words[@]}"; do
+    if [[ $token == *main.scopedExportRoot* ]]; then
+      [[ $next == 1 && $token == main.scopedExportRoot=/run/offload-export ]] || return 1
+      ((count += 1))
+    fi
+    if [[ $token == -X ]]; then next=1; else next=0; fi
+  done
+  [[ $count == 1 ]]
+}
 if ((export_only)) && [[ -e $HOME/.local/bin/offload || -L $HOME/.local/bin/offload ]] &&
-  ! go version -m "$HOME/.local/bin/offload" 2>/dev/null |
-    grep -Eq '(^|[[:space:]])-X[[:space:]]+main\.scopedExportRoot=/run/offload-export([[:space:]]|"|$)'; then
+  ! scoped_wrapper; then
   echo 'offload: installed wrapper is not known to use the scoped export; run a full install; nothing installed' >&2
   exit 1
 fi

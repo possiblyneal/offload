@@ -103,8 +103,8 @@ whether it pays.
 
 - `install.sh` takes no argument but `--export-only`; any other exits 2 with its usage
   before it reads anything. `--export-only` refuses before changes if an installed wrapper
-  cannot be verified from its Go build metadata as using the scoped export root; a full
-  install replaces that wrapper.
+  cannot be verified from its Go build metadata as using the scoped export root; duplicate
+  or ambiguous linker assignments refuse too. A full install replaces that wrapper.
 
 - `install.sh` then checks `offload.conf` and, before writing anything, refuses (exit 1,
   naming the line, "nothing installed") a config with no `remote` line or one whose
@@ -390,7 +390,8 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   `WAYLAND_DISPLAY` and `DBUS_*`, rebinds `SSH_AUTH_SOCK`, and adds `OFFLOAD_JOB=1`.
 
   Scoped placement also drops host agent metadata and unshared absolute `PATH` entries.
-  Go commands stay local when their active persisted Go environment file exists but is not shared.
+  Go commands stay local when their active persisted Go environment file exists but is not shared;
+  Go commands behind wrappers or scripts stay local when their effective environment is uncertain.
   It checks tool-specific file paths and preserves proxy endpoints.
 
 - Stdin: without `--stdin` the job reads EOF and the caller's stdin is never read, so a

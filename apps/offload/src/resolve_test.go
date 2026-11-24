@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -269,6 +271,37 @@ func TestScopedFilteringKeepsRepositoryAndDenyUnderUnsharedAncestor(t *testing.T
 	}
 	if _, err := resolvePathsFiltered(settings([]string{"Edit(//**)"}, nil), home, []string{repo}, fsys, excluded); err == nil {
 		t.Error("root guard lost")
+	}
+	if !slices.Contains(paths.writable, repo) {
+		t.Errorf("repository not writable: %v", paths.writable)
+	}
+	if !slices.Contains(paths.readOnly, denied) {
+		t.Errorf("deny lost: %v", paths.readOnly)
+	}
+}
+
+func TestJobPathsForScopedRepositoryAndDeny(t *testing.T) {
+	home := t.TempDir()
+	repo := filepath.Join(home, "code", "repo")
+	denied := filepath.Join(repo, "secret")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(denied, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), settings([]string{"Edit(~/**)"}, []string{"Edit(~/code/repo/secret)"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := exportView{root: "/synthetic", shared: []string{filepath.Join(home, "code"), "/var/tmp"}}
+	// Model the unshared home mount hiding the /tmp share except for the verified code bind.
+	mounts := []string{home}
+	paths, err := jobPathsFor(home, []string{repo}, func(p string) bool { return view.excludesWritable(mounts, p) })
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !slices.Contains(paths.writable, repo) {
 		t.Errorf("repository not writable: %v", paths.writable)

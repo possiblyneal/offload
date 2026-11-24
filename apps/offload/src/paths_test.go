@@ -757,3 +757,42 @@ func TestScopedGoConfigRefusal(t *testing.T) {
 		t.Errorf("XDG Go config: %q", got)
 	}
 }
+
+func TestGoConfigUsesEffectiveEnvironment(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	cwd := filepath.Join(base, "work")
+	private := filepath.Join(base, "private")
+	for _, dir := range []string{filepath.Join(home, ".config/go"), cwd, private} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{filepath.Join(home, ".config/go/env"), filepath.Join(private, "env")} {
+		if err := os.WriteFile(file, []byte("GOPROXY=off\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := exportView{root: "/synthetic", home: home, shared: []string{"/tmp", "/var/tmp"}}
+	mounts := []string{home, private}
+	cases := []struct {
+		name      string
+		env, argv []string
+		refuse    bool
+	}{
+		{"inline off", []string{"HOME=" + home}, []string{"GOENV=off", "go", "test"}, false},
+		{"inline off overrides inherited", []string{"HOME=" + home, "GOENV=" + filepath.Join(private, "env")}, []string{"GOENV=off", "go", "test"}, false},
+		{"relative inherited", []string{"HOME=" + home, "GOENV=../private/env"}, []string{"go", "test"}, true},
+		{"inline off inherited", []string{"HOME=" + home, "GOENV=off"}, []string{"GOENV=../private/env", "go", "test"}, true},
+		{"inline xdg", []string{"HOME=" + home}, []string{"XDG_CONFIG_HOME=" + cwd, "go", "test"}, false},
+		{"shell unknown", []string{"HOME=" + home, "GOENV=off"}, []string{"sh", "-c", "cd ../private && GOENV=env go test"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := tmpRefusalIn(mounts, cwd, c.env, c.argv, view)
+			if (got != "") != c.refuse {
+				t.Errorf("refusal %q, want refusal %v", got, c.refuse)
+			}
+		})
+	}
+}
