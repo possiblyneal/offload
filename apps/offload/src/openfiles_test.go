@@ -49,6 +49,7 @@ func TestLockDeviceMismatchNamesAPathWhoseDeviceIsNotItsMounts(t *testing.T) {
 // A writable path whose locks /proc/locks names under another device keeps the job here:
 // no holder of a lock there could be matched to the file it is on.
 func TestALockDeviceMismatchRefusesUnseenHolder(t *testing.T) {
+	useTestMounts(t)
 	dir := t.TempDir()
 	mi := filepath.Join(t.TempDir(), "mountinfo")
 	if err := os.WriteFile(mi, []byte("1 0 0:4242 / "+dir+" rw - btrfs /dev/x rw\n"), 0o644); err != nil {

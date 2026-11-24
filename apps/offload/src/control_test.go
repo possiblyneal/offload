@@ -1099,8 +1099,8 @@ func TestASignalAfterAWritePastTheFileSizeLimitKeepsSIGXFSZ(t *testing.T) {
 }
 
 func TestAStatusTheControlSessionEndedInsideIsLostContact(t *testing.T) {
-	job := exec.Command("sh", "-c", "exit 0")
-	out, _ := superviseWith(t, job, fakeLauncher("printf 'status exit 13'; exit;"), 0)
+	job, release := heldJob(t, "exit 0")
+	out, _ := superviseWith(t, job, fakeLauncher(release+"printf 'status exit 13'; exit;"), 0)
 	if out.code != 255 || out.fallback {
 		t.Errorf("a status cut before its newline: %+v, want lost contact (255)", out)
 	}

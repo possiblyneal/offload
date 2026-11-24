@@ -303,6 +303,7 @@ func TestGatherFactsFindsAHeldDatabaseOpenedThroughABind(t *testing.T) {
 // lock was taken by flock(1), which has ended, so /proc/locks names no living holder, and
 // the read of /proc/locks drops it, as a page skip may: the lock is found in fdinfo.
 func TestGatherFactsRefusesAJobUsingAFileAnotherAccountFlocks(t *testing.T) {
+	useTestMounts(t)
 	if exec.Command("sudo", "-n", "true").Run() != nil {
 		t.Skip("needs passwordless sudo")
 	}
@@ -324,7 +325,7 @@ func TestGatherFactsRefusesAJobUsingAFileAnotherAccountFlocks(t *testing.T) {
 	defer func(r func() string) { readLocks = r }(readLocks)
 	readLocks = func() string { return "" }
 	// Every process is read: a narrowed scan skips the hidden-holder check.
-	f, _ := gatherJobFacts(t.TempDir(), t.TempDir(), "", []string{"cat", lock}, []string{dir}, nil, nil, exportView{})
+	f, _ := gatherFacts(t.TempDir(), t.TempDir(), "", []string{"cat", lock}, []string{dir})
 	var st syscall.Stat_t
 	if err := syscall.Stat(lock, &st); err != nil {
 		t.Fatal(err)
@@ -335,7 +336,7 @@ func TestGatherFactsRefusesAJobUsingAFileAnotherAccountFlocks(t *testing.T) {
 	}
 	defer func(l func([]string) ([]openFile, error)) { listAsRoot = l }(listAsRoot)
 	listAsRoot = func([]string) ([]openFile, error) { return nil, errors.New("sudo: a password is required") }
-	f, _ = gatherJobFacts(t.TempDir(), t.TempDir(), "", []string{"cat", lock}, []string{dir}, nil, nil, exportView{})
+	f, _ = gatherFacts(t.TempDir(), t.TempDir(), "", []string{"cat", lock}, []string{dir})
 	if d := place(placeRequest{Remotes: []string{"server"}, Slots: map[string]slotState{"server": {Total: 1, Free: 1}}, Facts: f}); d.Rule != "unseen-holder" {
 		t.Errorf("without root: %+v, want the unseen-holder refusal", d)
 	}
@@ -420,12 +421,16 @@ func TestGatherFactsReadsAScriptsHomeAsTheJobsHome(t *testing.T) {
 // gatherFacts joins the cwd's links into the tmpfs refusal: a link onto /dev/shm, which the
 // export does not carry, keeps `make` here.
 func TestGatherFactsRefusesACwdLinkOntoAnUnexportedMount(t *testing.T) {
+	useTestMounts(t)
+	t.Setenv("TMPDIR", "/tmp")
 	cwd := t.TempDir()
-	if err := os.Symlink("/dev/shm", filepath.Join(cwd, "shm")); err != nil {
+	link := filepath.Join(cwd, "shm")
+	if err := os.Symlink("/dev/shm", link); err != nil {
 		t.Fatal(err)
 	}
-	if f, _ := gatherJobFacts(t.TempDir(), cwd, "", []string{"make"}, []string{cwd}, []string{"/dev/shm"}, nil, exportView{}); !strings.Contains(f.Tmpfs, "shm") {
-		t.Errorf("Tmpfs %q, want the link to /dev/shm refused", f.Tmpfs)
+	want := "link " + link + " leads onto dev's /dev/shm mount, which is not exported"
+	if f, _ := gatherFacts(t.TempDir(), cwd, "", []string{"make"}, []string{cwd}); f.Tmpfs != want {
+		t.Errorf("Tmpfs %q, want %q", f.Tmpfs, want)
 	}
 }
 

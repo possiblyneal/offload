@@ -16,6 +16,16 @@ import (
 	"time"
 )
 
+// testUnexportedMounts models an exported workspace and /tmp, with /dev/shm private.
+func testUnexportedMounts() []string { return []string{"/dev/shm"} }
+
+func useTestMounts(t *testing.T) {
+	t.Helper()
+	original := devMounts
+	t.Cleanup(func() { devMounts = original })
+	devMounts = testUnexportedMounts
+}
+
 // TestMain runs `offload` itself when OFFLOAD_TEST_RUN holds its arguments, joined by
 // \x1f, so a test can watch a run that ends in exec.
 func TestMain(m *testing.M) {
@@ -63,6 +73,9 @@ func TestMain(m *testing.M) {
 	}
 	if args := os.Getenv("OFFLOAD_TEST_RUN"); args != "" {
 		configDir = cmp.Or(os.Getenv("OFFLOAD_TEST_CONFIG"), configDir)
+		if os.Getenv("OFFLOAD_TEST_MOUNTS") == "1" {
+			devMounts = testUnexportedMounts
+		}
 		os.Exit(run(strings.Split(args, "\x1f")))
 	}
 	os.Exit(m.Run())
