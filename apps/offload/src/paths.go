@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -318,9 +319,13 @@ var envExempt = map[string]bool{"DISPLAY": true, "WAYLAND_DISPLAY": true, "XAUTH
 // unexported mount (a shell script's `> /dev/shm/out`, GOCOVERDIR=/tmp/c) refuses too:
 // running here loses nothing.
 func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string {
+	return tmpRefusalIn(mounts, cwd, env, argv, exportView{})
+}
+
+func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view exportView) string {
 	check := func(what, p string) string {
 		for _, q := range []string{filepath.Clean(p), realPath(p)} {
-			if m := within(mounts, q); m != "" {
+			if m := view.missing(mounts, q); m != "" {
 				return fmt.Sprintf("%s %s is on dev's %s mount, which is not exported", what, p, m)
 			}
 			if m := within(privateDirs, q); m != "" {
@@ -338,7 +343,7 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		if d := namesDir(s, append(privateDirs, runAliases...)); d != "" {
 			return d + ", which the job sees as a private directory removed when it ends"
 		}
-		if m := namesDir(s, mounts); m != "" {
+		if m := namesDir(s, mounts); view.root == "" && m != "" {
 			return "dev's " + m + " mount, which is not exported"
 		}
 		return ""
@@ -356,7 +361,7 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 	// Every job may write /tmp and /var/tmp; when either is a mount the export does not
 	// carry (a PrivateTmp service's), a remote job's files land where the caller cannot see.
 	for _, t := range sharedTmp {
-		if m := within(mounts, t); m != "" {
+		if m := view.missing(mounts, t); m != "" {
 			return fmt.Sprintf("%s is on dev's %s mount, which is not exported", t, m)
 		}
 	}
@@ -380,10 +385,22 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		if envExempt[name] || strings.HasPrefix(name, "DBUS_") {
 			continue
 		}
+		switch strings.ToUpper(name) {
+		case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY":
+			if u, err := url.Parse(v); err == nil && u.Scheme != "" && u.Host != "" && (u.Path == "" || u.Path == "/") {
+				continue // The proxy endpoint is a network address, not a file path.
+			}
+		}
 		if r := mentions(v); r != "" {
 			return name + " names " + r
 		}
-		if r := scriptRefusal(mounts, readArg(v, cwd, home).written, false); r != "" {
+		written := readArg(v, cwd, home).written
+		if view.root != "" {
+			written = slices.DeleteFunc(written, func(p string) bool {
+				return name == "HOME" && p == view.home || within(view.caches, p) != ""
+			})
+		}
+		if r := scriptRefusal(mounts, written, false, view); r != "" {
 			return name + " names " + r
 		}
 	}
@@ -408,7 +425,7 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		if r := mentions(a); r != "" {
 			return fmt.Sprintf("argument %q names %s", a, r)
 		}
-		if r := scriptRefusal(mounts, ap.written, true); r != "" {
+		if r := scriptRefusal(mounts, ap.written, true, view); r != "" {
 			return fmt.Sprintf("argument %q names %s", a, r)
 		}
 	}
@@ -420,14 +437,14 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 // a private directory, naming dev's own machine, or, with holds, holding an unexported
 // mount; or "". An environment value is judged without holds: HOME and PATH hold every
 // mount below them, and a job that walks one is told so in its arguments.
-func scriptRefusal(mounts []string, written []string, holds bool) string {
+func scriptRefusal(mounts []string, written []string, holds bool, view exportView) string {
 	for _, p := range written {
 		for _, q := range []string{p, realPath(p)} {
 			at := p
 			if q != p {
 				at = p + " (" + q + ")"
 			}
-			if m := within(mounts, q); m != "" {
+			if m := view.missing(mounts, q); m != "" {
 				return at + ", on dev's " + m + " mount, which is not exported"
 			}
 			if d := within(append(privateDirs, runAliases...), q); d != "" {

@@ -22,6 +22,10 @@ import (
 // configDir is set at build time by install.sh to the unit's config/ folder.
 var configDir string
 
+// scopedExportRoot is set by the restricted-view installer. An absent view
+// keeps jobs local rather than assuming the dev filesystem is exported.
+var scopedExportRoot string
+
 const usage = "usage: offload [--where local|<remote>] [--explain] [--stdin] -- <command> [args...]"
 
 func main() {
@@ -208,7 +212,16 @@ func runRemote(opts options) (int, error) {
 	}
 	stdio, problem := readStdio()
 	// Each output file is one the job writes, so the checks of its writable paths cover it.
-	facts, readOnly := gatherFacts(configDir, cwd, repo, argv, slices.Concat(paths.writable, stdio.paths()))
+	mounts := devMounts()
+	view := scopedExport(scopedExportRoot, accountHome(), configDir)
+	env := view.environment(os.Environ(), mounts)
+	if view.root != "" {
+		paths.writable = slices.DeleteFunc(paths.writable, func(p string) bool {
+			return view.missing(mounts, p) != "" || view.missing(mounts, realPath(p)) != "" ||
+				within([]string{"/etc", "/usr"}, realPath(p)) != ""
+		})
+	}
+	facts, readOnly := gatherJobFacts(configDir, cwd, repo, argv, slices.Concat(paths.writable, stdio.paths()), mounts, env, view)
 	req := placeRequest{
 		Where:   where,
 		Remotes: cfg.order,
@@ -231,13 +244,14 @@ func runRemote(opts options) (int, error) {
 		repo:     repo,
 		cwd:      cwd,
 		argv:     argv,
+		env:      env,
 		writable: paths.writable,
 		readOnly: append(paths.readOnly, readOnly...),
 		grace:    cfg.grace,
 	}
 	j.stdio = stdio
-	req.Facts.OutputFile = cmp.Or(problem, outputRefusal(stdio.files, devMounts(),
-		remoteLocalDirs(remoteLocalPaths(configDir, accountHome())), j.readOnly))
+	req.Facts.OutputFile = cmp.Or(problem, outputRefusal(stdio.files, mounts,
+		remoteLocalDirs(remoteLocalPaths(configDir, accountHome())), j.readOnly, view))
 	// The job opens its output files itself, so each must be writable there; one already
 	// under a writable path is (a bind of it would make a rename of it fail with EBUSY).
 	for _, p := range stdio.paths() {
@@ -353,7 +367,7 @@ func runOnRemote(cfg config, where string, j job, stdin bool) (outcome, error) {
 	if stdin {
 		follow = os.Stdin
 	}
-	in, onGo, err := jobStdin(envBlock(os.Environ()), follow)
+	in, onGo, err := jobStdin(envBlock(j.env), follow)
 	if err != nil {
 		return outcome{}, err
 	}

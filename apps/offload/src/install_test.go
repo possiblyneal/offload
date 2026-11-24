@@ -115,6 +115,7 @@ esac
 [ -t 0 ] || cat >/dev/null`,
 		"go": `printf 'go %s\n' "$*" >>"$FAKE_LOG"
 while [ $# -gt 0 ]; do [ "$1" = -o ] && printf '%s' "$fakeBuild" >"$2"; shift; done`,
+		"getent":    `printf 'probe:x:1000:1000::/home/probe:/bin/sh\n'`,
 		"dpkg":      `exit 0`,
 		"systemctl": `exit 0`,
 	} {
@@ -246,24 +247,39 @@ func TestUninstallRefusesWhileARemoteRunsAJobOrCannotSay(t *testing.T) {
 	}
 }
 
-// The export admits each remote to / and, with an fsid of its own, to dev's /tmp tmpfs,
-// which nfsd exports only so; without the second line a job's /tmp writes land in the
-// directory the tmpfs hides.
-func TestInstallExportsRootAndTmpToEachRemote(t *testing.T) {
-	code, _, stderr, _, root := installIn(t, "idle", "")
-	if code != 0 {
-		t.Fatalf("exit %d, stderr %q", code, stderr)
+// The synthetic root is the only fsid=0 export; each intended child is explicit.
+func TestInstallExportsSyntheticView(t *testing.T) {
+	bin, log := fakeInstallTools(t)
+	root := t.TempDir()
+	cmd := exec.Command(filepath.Join(installFixture(t), "install.sh"), "--export-only")
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+t.TempDir(), "FAKE_SSH=idle", "FAKE_LOG="+log, "FAKE_ROOT="+root)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install: %v: %s", err, out)
 	}
 	got, err := os.ReadFile(root + "/dev/etc/exports.d/offload.exports")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "/"
-	wantTmp := "/tmp"
-	want += " " + fixtureRemote + "(rw,sync,root_squash,no_subtree_check,fsid=0)"
-	wantTmp += " " + fixtureRemote + "(rw,sync,root_squash,no_subtree_check,fsid=1)"
-	if string(got) != want+"\n"+wantTmp+"\n" {
-		t.Errorf("exports %q, want %q", got, want+"\n"+wantTmp+"\n")
+	for _, line := range strings.Split(strings.TrimSpace(string(got)), "\n") {
+		if !strings.HasPrefix(line, "/run/offload-export") || strings.Contains(line, "crossmnt") {
+			t.Errorf("unsafe export %q", line)
+		}
+	}
+	want := []string{
+		"/run/offload-export " + fixtureRemote + "(ro,sync,root_squash,no_subtree_check,fsid=0)",
+		"/run/offload-export/usr " + fixtureRemote + "(ro,sync,root_squash,subtree_check,fsid=1)",
+		"/run/offload-export/etc " + fixtureRemote + "(ro,sync,root_squash,subtree_check,fsid=2)",
+		"/run/offload-export/tmp " + fixtureRemote + "(rw,sync,root_squash,subtree_check,fsid=3)",
+		"/run/offload-export/var/tmp " + fixtureRemote + "(rw,sync,root_squash,subtree_check,fsid=4)",
+		"/run/offload-export/home/probe/code " + fixtureRemote + "(rw,sync,root_squash,subtree_check,fsid=5)",
+		"/run/offload-export/home/probe/orca/workspaces " + fixtureRemote + "(rw,sync,root_squash,subtree_check,fsid=6)",
+	}
+	if string(got) != strings.Join(want, "\n")+"\n" {
+		t.Errorf("unexpected exports: %s", got)
+	}
+	unit, err := os.ReadFile(root + "/dev/etc/systemd/system/nfs-server.service.d/offload.conf")
+	if err != nil || !strings.Contains(string(unit), "Requires=offload-export-view.service\nAfter=offload-export-view.service") {
+		t.Errorf("NFS ordering: %q, %v", unit, err)
 	}
 }
 

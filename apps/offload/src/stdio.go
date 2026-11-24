@@ -201,12 +201,18 @@ func appending(fd int) bool {
 // outputRefusal is why a remote job could not reach one of files as dev's: under /dev,
 // /proc or /sys, which are the remote's own, on a mount the export does not carry, under a private directory, under a remote-local path, or bound
 // read-only in the job; or "".
-func outputRefusal(files []outputFile, mounts, remoteLocal, readOnly []string) string {
+func outputRefusal(files []outputFile, mounts, remoteLocal, readOnly []string, views ...exportView) string {
+	var view exportView
+	if len(views) != 0 {
+		view = views[0]
+	}
 	for _, f := range files {
 		for _, q := range []string{f.path, realPath(f.path)} {
 			switch {
-			case within(mounts, q) != "":
-				return fmt.Sprintf("the job's output file %s is on dev's %s mount, which is not exported", f.path, within(mounts, q))
+			case view.missing(mounts, q) != "":
+				return fmt.Sprintf("the job's output file %s is on dev's %s mount, which is not exported", f.path, view.missing(mounts, q))
+			case view.root != "" && within([]string{"/etc", "/usr"}, realPath(q)) != "":
+				return fmt.Sprintf("the job's output file %s is in the read-only system export", f.path)
 			case within(privateDirs, q) != "":
 				return fmt.Sprintf("the job's output file %s is under %s, which the job sees as a private directory", f.path, within(privateDirs, q))
 			case within([]string{"/dev", "/proc", "/sys"}, q) != "":

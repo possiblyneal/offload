@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"syscall"
@@ -95,6 +97,9 @@ func TestLauncherCommandCarriesTheCallersUmaskAndLimits(t *testing.T) {
 
 // Each soft limit goes as prlimit's name for it, in its own units, and none as "unlimited".
 func TestCallerRlimits(t *testing.T) {
+	if testWithFileSizeLimitInChild(t) {
+		return
+	}
 	var fsize, core syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &fsize); err != nil {
 		t.Fatal(err)
@@ -183,4 +188,22 @@ func TestLauncherCommandCarriesTheCallersIgnoredSignals(t *testing.T) {
 	if strings.Contains(got, "OFFLOAD_IGNORE") || strings.Contains(got, "OFFLOAD_BLOCK") {
 		t.Errorf("an empty signal list was passed: %q", got)
 	}
+}
+
+// Go's test-cache logger writes from the test process. Lower the process-wide
+// file size limit only in a child that has no cache log to corrupt.
+func testWithFileSizeLimitInChild(t *testing.T) bool {
+	t.Helper()
+	const child = "OFFLOAD_TEST_FILE_LIMIT_CHILD"
+	if os.Getenv(child) == "1" {
+		return false
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.v")
+	cmd.Env = append(os.Environ(), child+"=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("file size limit child: %v\n%s", err, output)
+	} else {
+		t.Logf("%s", output)
+	}
+	return true
 }

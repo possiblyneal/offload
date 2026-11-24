@@ -23,11 +23,23 @@ rm -f "$HOME/.local/bin/offload" "$HOME/.local/share/offload/auto.bash" \
   "$SYSTEMD/offload-health.service" "$SYSTEMD/offload-health.timer"
 systemctl --user daemon-reload
 
+if dpkg -s nfs-kernel-server >/dev/null 2>&1; then
+  sudo systemctl stop nfs-server
+fi
 sudo rm -f /etc/exports.d/offload.exports /etc/nfs.conf.d/offload.conf /etc/systemd/system/nfs-server.service.d/offload.conf
+if systemctl is-active --quiet offload-export-view.service; then
+  sudo exportfs -f
+  sudo systemctl stop offload-export-view.service
+fi
+sudo rm -f /etc/systemd/system/offload-export-view.service /usr/local/libexec/offload-export-view /etc/offload-export-paths
 sudo systemctl daemon-reload
 if dpkg -s nfs-kernel-server >/dev/null 2>&1; then
   sudo exportfs -ra
-  [[ -n "$(sudo exportfs -s)" ]] || sudo systemctl disable --now nfs-server >/dev/null 2>&1 || true
+  if [[ -n "$(sudo exportfs -s)" ]]; then
+    sudo systemctl start nfs-server
+  else
+    sudo systemctl disable --now nfs-server >/dev/null 2>&1 || true
+  fi
 fi
 
 for addr in "${remote_addrs[@]}"; do

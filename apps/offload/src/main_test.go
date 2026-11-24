@@ -439,11 +439,7 @@ func TestAnOutputFileAnotherProcessLocksKeepsTheJobHere(t *testing.T) {
 	if exec.Command("sudo", "-n", "true").Run() != nil {
 		t.Skip("needs passwordless sudo to read other accounts' open files")
 	}
-	cache, err := os.UserCacheDir() // on the exported disk, outside the repository
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := os.CreateTemp(cache, "offload-test-out-*")
+	out, err := os.CreateTemp(t.TempDir(), "offload-test-out-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,22 +472,13 @@ func TestAnOutputFileAnotherProcessLocksKeepsTheJobHere(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(config, "offload.conf"), []byte(conf), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A HOME of no settings leaves the repository the only writable path.
-	home, err := filepath.Abs("../../../tmp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	home, err = os.MkdirTemp(home, "offload-test-home-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(home) })
 	// The run opens the file itself: one this test shares would be relayed, not the job's.
 	out.Close()
 	var stderr bytes.Buffer
 	cmd := exec.Command("sh", "-c", `exec "$0" >"$1"`, os.Args[0], out.Name())
-	cmd.Env = append(os.Environ(), "HOME="+home, "OFFLOAD_TEST_CONFIG="+config,
-		"OFFLOAD_TEST_RUN="+strings.Join([]string{"--", "true"}, "\x1f"))
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir(), "OFFLOAD_TEST_CONFIG=" + config,
+		"OFFLOAD_TEST_RUN=--\x1ftrue"}
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("%v: %s", err, stderr.String())

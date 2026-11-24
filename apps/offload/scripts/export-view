@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Assemble the filesystem view; the caller owns the mount namespace and NFS exports.
+set -euo pipefail
+
+fail() { echo "offload export view: $*" >&2; exit 1; }
+[[ $# == 2 || $# == 3 ]] || fail 'expected <empty mount directory> <workspace owner home> [remote-local paths]'
+(( EUID == 0 )) || fail 'must run as root'
+view=$1 home=$2
+[[ $home =~ ^/home/[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || fail 'expected a home directly under /home'
+[[ $view = /* && $view != / && -d $view && -O $view && $(realpath -e -- "$view") == "$view" ]] ||
+  fail 'mount directory must be absolute, canonical, and owned by root'
+if mountpoint -q -- "$view" || [[ -n $(find "$view" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+  fail 'mount directory must be empty and not mounted'
+fi
+
+cache_paths=()
+if [[ $# == 3 ]]; then
+  while read -r first second extra; do
+    [[ -z $first || $first == \#* ]] && continue
+    if [[ $first == ro ]]; then path=$second; else path=$first; extra=${second:-}${extra:-}; fi
+    [[ -z ${extra:-} && $path =~ ^[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*$ && /$path/ != */../* && /$path/ != */./* ]] ||
+      fail "invalid remote-local path: $path"
+    case "$path/" in code/*|orca/*) fail "remote-local path overlaps a workspace: $path" ;; esac
+    cache_paths+=("$path")
+  done < "$3"
+fi
+
+read_only=(/etc /usr)
+writable=(/tmp /var/tmp "$home/code" "$home/orca/workspaces")
+for path in "${read_only[@]}" "${writable[@]}"; do
+  [[ -d $path && $(realpath -e -- "$path") == "$path" ]] || fail "not a canonical source directory: $path"
+  [[ $view != "$path" && $view != "$path/"* ]] || fail "mount directory is inside an export source: $path"
+done
+for path in bin sbin lib lib64; do
+  [[ ! -e /$path || -L /$path && $(readlink -- "/$path") == "usr/$path" ]] || fail "unsupported system path: /$path"
+done
+
+mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs "$view"
+trap 'umount --recursive "$view"' EXIT
+mount --make-private "$view"
+touch -- "$view/.offload-scoped"
+for path in bin sbin lib lib64; do
+  if [[ -L /$path ]]; then ln -s -- "usr/$path" "$view/$path"; fi
+done
+mkdir -p -- "$view"/{dev,proc,run,sys} "$view$home"
+for path in "${cache_paths[@]}"; do mkdir -p -- "$view$home/$path"; done
+# Use bind, not rbind: nested mounts in a source are not part of the view.
+for path in "${read_only[@]}" "${writable[@]}"; do
+  mkdir -p -- "$view$path"
+  mount --bind -- "$path" "$view$path"
+done
+for path in "${read_only[@]}"; do
+  mount -o remount,bind,ro -- "$view$path"
+done
+trap - EXIT

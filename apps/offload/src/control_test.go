@@ -1020,6 +1020,9 @@ func TestAReaderThatReadsEverythingSendsNoEndOfWrite(t *testing.T) {
 // A relayed write past the caller's file-size limit ends the run by SIGXFSZ, as the
 // kernel would have killed a local job, however the job itself ended.
 func TestAWritePastTheFileSizeLimitEndsTheRunBySIGXFSZ(t *testing.T) {
+	if testWithFileSizeLimitInChild(t) {
+		return
+	}
 	if inheritedIgnore(syscall.SIGXFSZ) {
 		t.Skip("the test runs with SIGXFSZ ignored")
 	}
@@ -1055,6 +1058,9 @@ func TestAWritePastTheFileSizeLimitEndsTheRunBySIGXFSZ(t *testing.T) {
 // The local job would have died of SIGXFSZ at its write, before a signal that later ends
 // the wait for its output: the run dies by SIGXFSZ.
 func TestASignalAfterAWritePastTheFileSizeLimitKeepsSIGXFSZ(t *testing.T) {
+	if testWithFileSizeLimitInChild(t) {
+		return
+	}
 	if inheritedIgnore(syscall.SIGXFSZ) {
 		t.Skip("the test runs with SIGXFSZ ignored")
 	}

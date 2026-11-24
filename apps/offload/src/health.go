@@ -100,16 +100,30 @@ func byRemote(m map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// runProbe runs `hostname` through offload on remote, from dir (offload's state folder: on
-// dev's disk, so exported, and small, so its link scan finishes) with no display, logging
-// its record to a file of its own, and judges it.
-func runProbe(self, dir, remote string) probe {
-	log := filepath.Join(dir, "probe-"+remote+".log")
-	_ = os.Remove(log)
-	defer os.Remove(log)
+// runProbe runs hostname through normal placement without sharing Offload's state directory.
+func runProbe(self, state, remote string) probe {
+	dir, err := os.MkdirTemp("/var/tmp", "offload-health-")
+	if err != nil {
+		return probe{remote, err.Error()}
+	}
+	defer os.RemoveAll(dir)
+	log := filepath.Join(dir, "probe.log")
 	cmd := exec.Command(self, "--where", remote, "--", "hostname")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "DISPLAY=", "WAYLAND_DISPLAY=", logOverride+"="+log)
+	cmd.Env = []string{"HOME=" + dir, "PATH=/usr/bin:/bin", logOverride + "=" + log}
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if !filepath.IsAbs(sock) {
+			base, err := filepath.Abs(state)
+			if err != nil {
+				return probe{remote, err.Error()}
+			}
+			sock = base + string(os.PathSeparator) + sock
+		}
+		cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+sock)
+	}
+	if nested, ok := os.LookupEnv("OFFLOAD_JOB"); ok {
+		cmd.Env = append(cmd.Env, "OFFLOAD_JOB="+nested)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	runErr := ""
