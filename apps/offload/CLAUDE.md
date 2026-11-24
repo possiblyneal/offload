@@ -1,4 +1,5 @@
-## Purpose
+<a id="purpose"></a>
+## Purpose & Tradeoffs
 
 `offload [--where local|<remote>] -- <cmd>` runs a command on another machine as if it ran on
 dev: the remote mounts dev's filesystem inside a mount namespace of the one job and runs
@@ -85,7 +86,10 @@ whether it pays.
   `scripts/integration`; needs the server. The gate leaves out import paths with a
   `/tests/integration` segment, so the module path must keep one
 
-## Local Contracts
+## Child Index
+
+<a id="local-contracts"></a>
+## Contracts
 
 ### Install and uninstall
 
@@ -671,7 +675,8 @@ Accepted limits of signals:
 
   Dev is shared, so compare medians and read `bg_run`.
 
-## Work Guidance
+<a id="work-guidance"></a>
+## Execution & Escalation
 
 - A job sees dev's `HTTP(S)_PROXY` work as on dev: do not clear it in tests or scripts.
 
@@ -682,7 +687,8 @@ Accepted limits of signals:
   non-blocking suspicion, batched into one issue. A watch-serve or build-on-dev misread
   never blocks.
 
-## Verification
+<a id="verification"></a>
+## Commands & Verification
 
 - `scripts/check` runs the unit tests in `src/`. `protocol_test.go` reads the control
   records, signal names and stdio plan each of the wrapper, `offload-launch` and
