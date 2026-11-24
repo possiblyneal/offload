@@ -796,3 +796,36 @@ func TestGoConfigUsesEffectiveEnvironment(t *testing.T) {
 		})
 	}
 }
+
+func TestInheritedGoConfigOverridesDefault(t *testing.T) {
+	for _, name := range []string{"GOENV", "XDG_CONFIG_HOME"} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			home, cwd := filepath.Join(base, "home"), filepath.Join(base, "work")
+			configDir := filepath.Join(base, "alternate")
+			config := filepath.Join(configDir, "go", "env")
+			for _, dir := range []string{home, cwd, filepath.Dir(config)} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(config, []byte("GOPROXY=off\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			view := exportView{root: "/synthetic", home: home, shared: []string{"/tmp", "/var/tmp"}}
+			mounts := []string{config}
+			env := []string{"HOME=" + home}
+			if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test"}, view); got != "" {
+				t.Fatalf("default config should allow placement: %q", got)
+			}
+			if name == "GOENV" {
+				env = append(env, "GOENV=../alternate/go/env")
+			} else {
+				env = append(env, "XDG_CONFIG_HOME="+configDir)
+			}
+			if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test"}, view); !strings.Contains(got, "Go configuration "+config) {
+				t.Errorf("inherited %s should refuse for %s, got %q", name, config, got)
+			}
+		})
+	}
+}
