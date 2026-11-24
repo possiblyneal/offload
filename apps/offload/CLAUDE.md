@@ -324,8 +324,9 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   through `CLAUDE_ENV_FILE` in a `SessionStart` hook. Install does not edit startup files.
 - The shell routes direct `go build` and `go test` through the existing Offload command
   with no keyboard input. It passes through redirected input, custom executors, custom
-  test arguments, explicit output flags and nonempty `GOFLAGS`. Use `command go` for a job that needs the local
-  terminal, or `OFFLOAD_AUTO=0` to disable automatic routing.
+  test arguments (including unrecognized `go test` flags), explicit output flags and
+  nonempty `GOFLAGS`. Use `command go` for a job that needs the local terminal, or
+  `OFFLOAD_AUTO=0` to disable automatic routing.
 - The Bash function is not exported. Other commands, scripts (including `scripts/check`
   and `scripts/ci`), and explicit `offload --` calls keep their existing behavior. A runner
   such as `apps/session-review/src/review.py` may still call Offload itself.

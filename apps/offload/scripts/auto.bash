@@ -17,6 +17,13 @@ go() {
           return
           ;;
       esac
+      if [[ $1 = test ]]; then
+        # Go can forward unknown flags to the test binary without -args.
+        case ${arg%%=*} in
+          bench | benchmem | benchtime | count | cover | covermode | coverpkg | cpu | failfast | fullpath | fuzz | fuzzminimizetime | fuzztime | json | list | parallel | race | run | short | shuffle | skip | timeout | v) ;;
+          *) command go "$@"; return ;;
+        esac
+      fi
     done
     # Check persistent GOFLAGS too: an alternate executor can need local input.
     if real_go=$(type -P go) && [[ $real_go = /* ]] &&
