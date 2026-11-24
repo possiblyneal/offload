@@ -206,21 +206,19 @@ func runRemote(opts options) (int, error) {
 		return 0, err
 	}
 	repo := gitToplevel(cwd)
-	paths, err := jobPathsFor(home, jobRepos(cwd))
+	mounts := devMounts()
+	view := scopedExport(scopedExportRoot, accountHome(), configDir)
+	var excluded func(string) bool
+	if view.root != "" {
+		excluded = func(p string) bool { return view.excludesWritable(mounts, p) }
+	}
+	paths, err := jobPathsFor(home, jobRepos(cwd), excluded)
 	if err != nil {
 		return 0, err
 	}
 	stdio, problem := readStdio()
 	// Each output file is one the job writes, so the checks of its writable paths cover it.
-	mounts := devMounts()
-	view := scopedExport(scopedExportRoot, accountHome(), configDir)
 	env := view.environment(os.Environ(), mounts)
-	if view.root != "" {
-		paths.writable = slices.DeleteFunc(paths.writable, func(p string) bool {
-			return view.missing(mounts, p) != "" || view.missing(mounts, realPath(p)) != "" ||
-				within([]string{"/etc", "/usr"}, realPath(p)) != ""
-		})
-	}
 	facts, readOnly := gatherJobFacts(configDir, cwd, repo, argv, slices.Concat(paths.writable, stdio.paths()), mounts, env, view)
 	req := placeRequest{
 		Where:   where,

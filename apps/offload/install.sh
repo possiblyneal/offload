@@ -20,6 +20,15 @@ esac
 . "$UNIT/scripts/remotes.sh"
 read_remotes "$CONF" "nothing installed"
 
+# An export-only migration must not strand an installed legacy wrapper. Build metadata
+# identifies the scoped root baked in by a full install; unknown builds fail closed.
+if ((export_only)) && [[ -e $HOME/.local/bin/offload || -L $HOME/.local/bin/offload ]] &&
+  ! go version -m "$HOME/.local/bin/offload" 2>/dev/null |
+    grep -Eq '(^|[[:space:]])-X[[:space:]]+main\.scopedExportRoot=/run/offload-export([[:space:]]|"|$)'; then
+  echo 'offload: installed wrapper is not known to use the scoped export; run a full install; nothing installed' >&2
+  exit 1
+fi
+
 # A running job would read a launcher half replaced (its job half re-execs the file),
 # lose its firewall while the rules reload, or see its NFS calls fail while nfs-server
 # restarts (--export-only too), so nothing is installed while any remote runs one, or

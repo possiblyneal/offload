@@ -75,6 +75,11 @@ func (v exportView) missing(mounts []string, p string) string {
 	return ""
 }
 
+func (v exportView) excludesWritable(mounts []string, p string) bool {
+	return v.missing(mounts, p) != "" || v.missing(mounts, realPath(p)) != "" ||
+		within([]string{"/etc", "/usr"}, realPath(p)) != ""
+}
+
 func (v exportView) environment(env, mounts []string) []string {
 	if v.root == "" {
 		return env

@@ -527,3 +527,16 @@ func TestGatherFactsRefusesAStoreCommandAsRemoteLocal(t *testing.T) {
 		t.Errorf("WatchServe %q, want the store command left to remote-local", f.WatchServe)
 	}
 }
+
+func TestScopedSharedMountStaysWritable(t *testing.T) {
+	cwd := t.TempDir()
+	nested := filepath.Join(cwd, "nested")
+	view := exportView{root: "/synthetic", shared: []string{"/tmp", "/var/tmp", cwd}}
+	_, readOnly := gatherJobFacts(t.TempDir(), cwd, "", []string{"true"}, []string{cwd}, []string{cwd, nested}, nil, view)
+	if slices.Contains(readOnly, cwd) {
+		t.Errorf("shared mount classified read-only: %v", readOnly)
+	}
+	if !slices.Contains(readOnly, nested) {
+		t.Errorf("nested excluded mount not read-only: %v", readOnly)
+	}
+}

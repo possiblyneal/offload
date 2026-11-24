@@ -86,7 +86,7 @@ func gatherJobFacts(configDir, cwd, repo string, argv, writable, mounts, env []s
 	f.Foreign = foreignPlan(targets, held, devs, seen, hostPathsOf)
 	readOnly = append(readOnly, lockReadOnly...)
 	if view.root != "" {
-		mounts = slices.DeleteFunc(slices.Clone(mounts), func(p string) bool { return holding(view.shared, p) != "" })
+		mounts = slices.DeleteFunc(slices.Clone(mounts), func(p string) bool { return slices.Contains(view.shared, p) || holding(view.shared, p) != "" })
 	}
 	return f, append(readOnly, readOnlyMounts(slices.Concat(mounts, devReadOnlySelfBinds()), writable)...)
 }

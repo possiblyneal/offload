@@ -17,14 +17,14 @@ import (
 
 // jobPathsFor resolves the writable and read-only paths from the Operator's Claude
 // Code settings. Missing settings mean no rules: the job's repository alone is writable.
-func jobPathsFor(home string, repos []string) (jobPaths, error) {
+func jobPathsFor(home string, repos []string, excluded func(string) bool) (jobPaths, error) {
 	settings, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		settings = []byte("{}")
 	} else if err != nil {
 		return jobPaths{}, err
 	}
-	return resolvePaths(settings, home, repos, os.DirFS("/"))
+	return resolvePathsFiltered(settings, home, repos, os.DirFS("/"), excluded)
 }
 
 // remoteLocalPath is a configured tool-cache path, under home, that the launcher binds from
@@ -338,6 +338,36 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 		return ""
 	}
 	home := scriptHome(env)
+	if view.root != "" && findCommand(argv, func(cmd []string) string {
+		if filepath.Base(cmd[0]) == "go" {
+			return "go"
+		}
+		return ""
+	}) != "" {
+		var goenv, xdg string
+		for _, entry := range env {
+			name, value, _ := strings.Cut(entry, "=")
+			switch name {
+			case "GOENV":
+				goenv = value
+			case "XDG_CONFIG_HOME":
+				xdg = value
+			}
+		}
+		if goenv == "" {
+			if xdg == "" {
+				xdg = filepath.Join(home, ".config")
+			}
+			goenv = filepath.Join(xdg, "go", "env")
+		}
+		if goenv != "off" {
+			if _, err := os.Stat(goenv); err == nil {
+				if reason := check("Go configuration", goenv); reason != "" {
+					return reason
+				}
+			}
+		}
+	}
 	mentions := func(s string) string {
 		s = squashPath(s)
 		if d := namesDir(s, append(privateDirs, runAliases...)); d != "" {

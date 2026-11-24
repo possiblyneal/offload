@@ -114,6 +114,7 @@ case $* in
 esac
 [ -t 0 ] || cat >/dev/null`,
 		"go": `printf 'go %s\n' "$*" >>"$FAKE_LOG"
+if [ "$1" = version ]; then cat "$3"; exit; fi
 while [ $# -gt 0 ]; do [ "$1" = -o ] && printf '%s' "$fakeBuild" >"$2"; shift; done`,
 		"getent":    `printf 'probe:x:1000:1000::/home/probe:/bin/sh\n'`,
 		"dpkg":      `exit 0`,
@@ -247,12 +248,45 @@ func TestUninstallRefusesWhileARemoteRunsAJobOrCannotSay(t *testing.T) {
 	}
 }
 
+func TestExportOnlyRefusesLegacyWrapperBeforeChanges(t *testing.T) {
+	bin, log := fakeInstallTools(t)
+	root, home := t.TempDir(), t.TempDir()
+	wrapper := filepath.Join(home, ".local/bin/offload")
+	if err := os.MkdirAll(filepath.Dir(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrapper, []byte("legacy wrapper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(filepath.Join(installFixture(t), "install.sh"), "--export-only")
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+home, "FAKE_SSH=idle", "FAKE_LOG="+log, "FAKE_ROOT="+root)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "nothing installed") {
+		t.Errorf("exit %v, output %q, want a refusal", err, out)
+	}
+	calls, _ := os.ReadFile(log)
+	if strings.Contains(string(calls), "sudo ") {
+		t.Errorf("refused install made changes: %s", calls)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dev")); !os.IsNotExist(err) {
+		t.Errorf("refused install wrote dev files: %v", err)
+	}
+}
+
 // The synthetic root is the only fsid=0 export; each intended child is explicit.
 func TestInstallExportsSyntheticView(t *testing.T) {
 	bin, log := fakeInstallTools(t)
-	root := t.TempDir()
+	root, home := t.TempDir(), t.TempDir()
+	wrapper := filepath.Join(home, ".local/bin/offload")
+	if err := os.MkdirAll(filepath.Dir(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := "build\t-ldflags=\"-X main.configDir=/fixture/config -X main.scopedExportRoot=/run/offload-export\"\n"
+	if err := os.WriteFile(wrapper, []byte(metadata), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(filepath.Join(installFixture(t), "install.sh"), "--export-only")
-	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+t.TempDir(), "FAKE_SSH=idle", "FAKE_LOG="+log, "FAKE_ROOT="+root)
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+home, "FAKE_SSH=idle", "FAKE_LOG="+log, "FAKE_ROOT="+root)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install: %v: %s", err, out)
 	}

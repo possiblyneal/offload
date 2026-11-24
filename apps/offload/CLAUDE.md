@@ -102,7 +102,9 @@ whether it pays.
   run the legacy installer on dev: that export exposes the covered home directories.
 
 - `install.sh` takes no argument but `--export-only`; any other exits 2 with its usage
-  before it reads anything.
+  before it reads anything. `--export-only` refuses before changes if an installed wrapper
+  cannot be verified from its Go build metadata as using the scoped export root; a full
+  install replaces that wrapper.
 
 - `install.sh` then checks `offload.conf` and, before writing anything, refuses (exit 1,
   naming the line, "nothing installed") a config with no `remote` line or one whose
@@ -154,7 +156,8 @@ whether it pays.
   allow rule of `~/.claude/settings.json`, read at each launch, less the deny rules.
   Dev's `/tmp` and `/var/tmp` are always writable (`sharedTmp`). `resolvePaths`
   (`resolve.go`) owns the rule syntax and the `**` search limits; a rule that makes `/`
-  itself writable fails every launch loudly.
+  itself writable fails every launch loudly. Scoped placement filters unshared candidates
+  before collapsing writable roots, so an unshared ancestor cannot hide a shared repository.
 
 - **Read-only**, each listed by `--explain` and bound over the writable mount so a write
   fails naming the path:
@@ -385,7 +388,9 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   (NUL-terminated entries ended by an empty one; the command line is world-readable on the
   remote) and is applied by the final `env -i` after `setpriv`. The job drops `DISPLAY`,
   `WAYLAND_DISPLAY` and `DBUS_*`, rebinds `SSH_AUTH_SOCK`, and adds `OFFLOAD_JOB=1`.
+
   Scoped placement also drops host agent metadata and unshared absolute `PATH` entries.
+  Go commands stay local when their active persisted Go environment file exists but is not shared.
   It checks tool-specific file paths and preserves proxy endpoints.
 
 - Stdin: without `--stdin` the job reads EOF and the caller's stdin is never read, so a

@@ -724,3 +724,36 @@ func TestReadArg(t *testing.T) {
 		}
 	}
 }
+
+func TestScopedGoConfigRefusal(t *testing.T) {
+	home := t.TempDir()
+	config := filepath.Join(home, ".config", "go", "env")
+	if err := os.MkdirAll(filepath.Dir(config), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("GOPROXY=off\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := exportView{root: "/synthetic", shared: []string{"/tmp", "/var/tmp"}}
+	mounts := []string{filepath.Dir(config)}
+	env := []string{"HOME=" + home}
+	cwd := t.TempDir()
+	if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test", "./..."}, view); !strings.Contains(got, config) {
+		t.Errorf("active Go config: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, append(env, "GOENV=off"), []string{"go", "test"}, view); got != "" {
+		t.Errorf("disabled Go config: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, env, []string{"true"}, view); got != "" {
+		t.Errorf("non-Go command: %q", got)
+	}
+	if got := tmpRefusalIn(nil, cwd, env, []string{"go", "build"}, view); got != "" {
+		t.Errorf("shared Go config: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, append(env, "GOENV="+config), []string{"go", "build"}, view); !strings.Contains(got, config) {
+		t.Errorf("explicit Go config: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, append(env, "XDG_CONFIG_HOME="+filepath.Join(home, ".config")), []string{"go", "build"}, view); !strings.Contains(got, config) {
+		t.Errorf("XDG Go config: %q", got)
+	}
+}

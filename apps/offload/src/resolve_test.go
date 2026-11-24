@@ -256,3 +256,24 @@ func TestUnderAndCollapseTreatTheRootAsHoldingEverything(t *testing.T) {
 		t.Errorf("collapse = %v, want [/]", got)
 	}
 }
+
+func TestScopedFilteringKeepsRepositoryAndDenyUnderUnsharedAncestor(t *testing.T) {
+	repo := home + "/code/repo"
+	denied := repo + "/secret"
+	fsys := tree(denied)
+	view := exportView{root: "/synthetic", shared: []string{home + "/code", "/tmp", "/var/tmp"}}
+	excluded := func(p string) bool { return view.excludesWritable(nil, p) }
+	paths, err := resolvePathsFiltered(settings([]string{"Edit(~/**)"}, []string{"Edit(~/code/repo/secret)"}), home, []string{repo}, fsys, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolvePathsFiltered(settings([]string{"Edit(//**)"}, nil), home, []string{repo}, fsys, excluded); err == nil {
+		t.Error("root guard lost")
+	}
+	if !slices.Contains(paths.writable, repo) {
+		t.Errorf("repository not writable: %v", paths.writable)
+	}
+	if !slices.Contains(paths.readOnly, denied) {
+		t.Errorf("deny lost: %v", paths.readOnly)
+	}
+}
