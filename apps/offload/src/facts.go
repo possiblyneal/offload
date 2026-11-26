@@ -16,17 +16,20 @@ import (
 // ones (the job's, as resolvePaths gave them) that the job must see read-only: databases
 // another dev process has open, and mounts the export does not carry.
 func gatherFacts(configDir, cwd, repo string, argv, writable []string) (refusalFacts, []string) {
-	mounts, env := devMounts(), os.Environ()
+	return gatherJobFacts(configDir, cwd, repo, argv, writable, devMounts(), os.Environ(), exportView{})
+}
+
+func gatherJobFacts(configDir, cwd, repo string, argv, writable, mounts, env []string, view exportView) (refusalFacts, []string) {
 	// remote-local paths are the account's whatever HOME says; a script's `~` is the job's HOME.
 	home, shellHome := accountHome(), scriptHome(env)
 	// The link walk takes seconds under a large tree, so a job the tmpfs rule already
 	// keeps here, which no later rule can send away, skips it.
-	tmpfs := tmpRefusal(mounts, cwd, env, argv)
+	tmpfs := tmpRefusalIn(mounts, cwd, env, argv, view)
 	var links []string
 	if tmpfs == "" {
 		var linkProblem string
 		links, linkProblem = jobLinks(cwd, repo)
-		tmpfs = cmp.Or(linkProblem, cwdLinkRefusal(mounts, links))
+		tmpfs = cmp.Or(linkProblem, cwdLinkRefusal(mounts, links, view))
 	}
 	f := refusalFacts{
 		Tty:   stdinIsTerminal(),
@@ -82,6 +85,9 @@ func gatherFacts(configDir, cwd, repo string, argv, writable []string) (refusalF
 	f.Flock, lockReadOnly = flockPlan(targets, held, seen, cwd, repo, shellHome, argv, env)
 	f.Foreign = foreignPlan(targets, held, devs, seen, hostPathsOf)
 	readOnly = append(readOnly, lockReadOnly...)
+	if view.root != "" {
+		mounts = slices.DeleteFunc(slices.Clone(mounts), func(p string) bool { return slices.Contains(view.shared, p) || holding(view.shared, p) != "" })
+	}
 	return f, append(readOnly, readOnlyMounts(slices.Concat(mounts, devReadOnlySelfBinds()), writable)...)
 }
 

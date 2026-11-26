@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up offloading from dev, idempotently: the NFS export of / limited to the remotes in
+# Set up offloading from dev, idempotently: a synthetic NFS export limited to the remotes in
 # config/offload.conf, the launcher on each remote, ~/.local/bin/offload and its health
 # timer. Needs ssh and passwordless sudo on every machine. `uninstall.sh` undoes all of it.
 #   install.sh [--export-only]   dev's export and nfsd tuning only: no remote, no command
@@ -20,6 +20,40 @@ esac
 . "$UNIT/scripts/remotes.sh"
 read_remotes "$CONF" "nothing installed"
 
+# An export-only migration must not strand an installed legacy wrapper. Accept only
+# unambiguous linker metadata; never execute the wrapper to inspect it.
+scoped_wrapper() {
+  local metadata line flags='' token next=0 count=0 flag_lines=0
+  local -a words
+  metadata=$(go version -m "$HOME/.local/bin/offload" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]*build[[:space:]]+-ldflags=\"([^\"]*)\"$ ]]; then
+      ((flag_lines += 1))
+      [[ $flag_lines == 1 ]] || return 1
+      flags=${BASH_REMATCH[1]}
+    elif [[ $line == *-ldflags=* ]]; then
+      return 1
+    fi
+  done <<<"$metadata"
+  [[ -n $flags && $flags != *\\* && $flags != *\"* ]] || return 1
+  read -r -a words <<<"$flags"
+  for token in "${words[@]}"; do
+    # Go treats a single quote as quoting only at the start of a field.
+    [[ $token != \'* ]] || return 1
+    if [[ $token == *main.scopedExportRoot* ]]; then
+      [[ $next == 1 && $token == main.scopedExportRoot=/run/offload-export ]] || return 1
+      ((count += 1))
+    fi
+    if [[ $token == -X ]]; then next=1; else next=0; fi
+  done
+  [[ $count == 1 ]]
+}
+if ((export_only)) && [[ -e $HOME/.local/bin/offload || -L $HOME/.local/bin/offload ]] &&
+  ! scoped_wrapper; then
+  echo 'offload: installed wrapper is not known to use the scoped export; run a full install; nothing installed' >&2
+  exit 1
+fi
+
 # A running job would read a launcher half replaced (its job half re-execs the file),
 # lose its firewall while the rules reload, or see its NFS calls fail while nfs-server
 # restarts (--export-only too), so nothing is installed while any remote runs one, or
@@ -36,11 +70,9 @@ if ! dpkg -s nfs-kernel-server >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server
 fi
 
-changed=0
 write_root_file() { # <path> <content>
   if [[ "$(sudo cat "$1" 2>/dev/null || true)" != "$2" ]]; then
     printf '%s\n' "$2" | sudo install -D -m 0644 /dev/stdin "$1"
-    changed=1
   fi
 }
 
@@ -50,24 +82,53 @@ vers2=n
 vers3=n
 udp=n"
 
-# / and, beside it, /tmp: a tmpfs, which nfsd exports only with an fsid of its own. NFSv4
-# crosses into it from /, so a remote's mount of / sees dev's /tmp, and a job's writes
-# there land on dev as a local run's do.
-export_line="/" tmp_line="/tmp"
-for addr in "${remote_addrs[@]}"; do
-  export_line+=" $addr(rw,sync,root_squash,no_subtree_check,fsid=0)"
-  tmp_line+=" $addr(rw,sync,root_squash,no_subtree_check,fsid=1)"
-done
-write_root_file /etc/systemd/system/nfs-server.service.d/offload.conf "[Service]
-ExecStartPost=/bin/sh -c 'for p in \$(pgrep -x nfsd); do renice -n $NFSD_NICE -p \$p; done'"
-write_root_file /etc/exports.d/offload.exports "$export_line
-$tmp_line"
-
-if [[ $changed -eq 1 ]]; then sudo systemctl daemon-reload; fi
-if [[ $changed -eq 1 ]] || ! systemctl is-active --quiet nfs-server; then
-  sudo systemctl enable nfs-server >/dev/null 2>&1
-  sudo systemctl restart nfs-server
+# Stop serving before replacing the view or its exports. A failed view start must leave
+# nfs-server stopped rather than expose an underlying directory or an incomplete view.
+home=$(getent passwd "$(id -u)" | cut -d: -f6)
+[[ $home =~ ^/home/[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || { echo 'offload: unsupported account home' >&2; exit 1; }
+sudo systemctl stop nfs-server
+if systemctl is-active --quiet offload-export-view.service; then
+  sudo exportfs -f
+  sudo systemctl stop offload-export-view.service
 fi
+sudo install -d -m 0755 /run/offload-export
+sudo install -Dm0755 "$UNIT/scripts/export-view" /usr/local/libexec/offload-export-view
+sudo install -Dm0644 "$UNIT/config/remote-local-paths" /etc/offload-export-paths
+write_root_file /etc/systemd/system/offload-export-view.service "[Unit]
+Description=Offload synthetic NFS export view
+Before=nfs-server.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=offload-export
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/libexec/offload-export-view /run/offload-export $home /etc/offload-export-paths
+ExecStop=/usr/bin/umount --recursive /run/offload-export"
+write_root_file /etc/systemd/system/nfs-server.service.d/offload.conf "[Unit]
+Requires=offload-export-view.service
+After=offload-export-view.service
+[Service]
+ExecStartPost=/bin/sh -c 'for p in \$(pgrep -x nfsd); do renice -n $NFSD_NICE -p \$p; done'"
+
+exports=""
+for path in / /usr /etc /tmp /var/tmp "$home/code" "$home/orca/workspaces"; do
+  line="/run/offload-export${path%/}"
+  case $path in
+    /) options=ro,sync,root_squash,no_subtree_check,fsid=0 ;;
+    /usr) options=ro,sync,root_squash,subtree_check,fsid=1 ;;
+    /etc) options=ro,sync,root_squash,subtree_check,fsid=2 ;;
+    /tmp) options=rw,sync,root_squash,subtree_check,fsid=3 ;;
+    /var/tmp) options=rw,sync,root_squash,subtree_check,fsid=4 ;;
+    "$home/code") options=rw,sync,root_squash,subtree_check,fsid=5 ;;
+    "$home/orca/workspaces") options=rw,sync,root_squash,subtree_check,fsid=6 ;;
+  esac
+  for addr in "${remote_addrs[@]}"; do line+=" $addr($options)"; done
+  exports+="${exports:+$'\n'}$line"
+done
+write_root_file /etc/exports.d/offload.exports "$exports"
+sudo systemctl daemon-reload
+sudo systemctl enable nfs-server >/dev/null 2>&1
+sudo systemctl start nfs-server
 sudo exportfs -ra
 if ((export_only)); then
   echo "offload: export and nfsd tuning applied"
@@ -135,8 +196,9 @@ done
 
 # dev: the command. The config path is baked in so the binary finds it from anywhere.
 mkdir -p "$HOME/.local/bin"
-(cd "$UNIT/src" && go build -ldflags "-X main.configDir=$UNIT/config" -o "$HOME/.local/bin/offload" .)
+(cd "$UNIT/src" && go build -ldflags "-X main.configDir=$UNIT/config -X main.scopedExportRoot=/run/offload-export" -o "$HOME/.local/bin/offload" .)
 echo "offload: installed $HOME/.local/bin/offload"
+install -Dm0644 "$UNIT/scripts/auto.bash" "$HOME/.local/share/offload/auto.bash"
 
 # dev: the health check, every 30 minutes, reporting to the homelab panel. Copied, as the
 # command is, so the timer never runs units from a checkout that may be removed.

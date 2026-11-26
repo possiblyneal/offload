@@ -80,6 +80,9 @@ whether it pays.
   remote runs a job (`refuse_while_jobs`), and holds `remote_ssh`, every remote call's ssh,
   which gives up on a remote that stops answering rather than hanging
 
+- `scripts/export-view` — prepares a synthetic filesystem root with read-only system
+  paths and explicit workspace and temp binds; it does not publish NFS exports.
+
 - `scripts/benchmark` — the benchmark gate: reproduces every run and prints the tables
 
 - `tests/integration/` — its own Go module, `devex/offload/tests/integration`, run by
@@ -93,8 +96,15 @@ whether it pays.
 
 ### Install and uninstall
 
+- The Operator authorizes Offload maintenance and quiet deployment cutovers without
+  additional approval. On dev, only the code and Orca workspace trees may be shared
+  from `/home`. Do not restore the legacy `/` export from `offload.exports.paused` or
+  run the legacy installer on dev: that export exposes the covered home directories.
+
 - `install.sh` takes no argument but `--export-only`; any other exits 2 with its usage
-  before it reads anything.
+  before it reads anything. `--export-only` refuses before changes if an installed wrapper
+  cannot be verified from its Go build metadata as using the scoped export root; duplicate
+  or ambiguous linker assignments refuse too. A full install replaces that wrapper.
 
 - `install.sh` then checks `offload.conf` and, before writing anything, refuses (exit 1,
   naming the line, "nothing installed") a config with no `remote` line or one whose
@@ -115,17 +125,20 @@ whether it pays.
   The job firewall is replaced in one `nft -f` transaction, never by restarting
   `offload-net.service`, whose stop deletes the tables before its start loads them.
 
-- `install.sh` writes `/etc/exports.d/offload.exports` (`/` over NFSv4.2 to each remote
-  only, `rw,sync,root_squash,no_subtree_check,fsid=0`, and `/tmp` beside it, `fsid=1`),
-  `/etc/nfs.conf.d/offload.conf` (8 nfsd threads, v4 only) and a drop-in
-  `/etc/systemd/system/nfs-server.service.d/offload.conf` that renices the nfsd threads to
-  -10 after each start (kernel threads sit in the root cgroup, so `CPUWeight` cannot reach
-  them).
+- `install.sh` serves a read-only synthetic NFSv4 root under `/run/offload-export`.
+  It explicitly exports `/usr` and `/etc` read-only, and `/tmp`, `/var/tmp`, `~/code`
+  and `~/orca/workspaces` writable. All exports are `root_squash` and restricted to
+  configured remotes. The source binds are nonrecursive; nested mounts are not shared.
+  Cache mountpoints exist in the synthetic view but contain no dev cache data.
+
+  `offload-export-view.service` must succeed before `nfs-server` starts. Use an idle
+  window: replacing or removing the view stops NFS, interrupting any other exports.
+  The NFS drop-in also renices nfsd after start; `CPUWeight` cannot reach the kernel threads.
 
   It installs `/usr/local/libexec/offload-launch`, `offload-bind`, `offload-forward`,
   `offload-wait` and `/etc/offload/` on each remote, with the `nftables` package and
   `offload-net.service` and `offload-cut.service`; and builds `~/.local/bin/offload` with
-  `config/` baked in through `-X main.configDir`. The three Go helpers are built static
+  the config directory and scoped export root baked in. The three Go helpers are built static
   for linux/amd64, the remotes' one arch, and pushed from a temporary directory. Last, it
   copies the health units (copied, not linked, as the command is) and enables the timer.
 
@@ -143,7 +156,8 @@ whether it pays.
   allow rule of `~/.claude/settings.json`, read at each launch, less the deny rules.
   Dev's `/tmp` and `/var/tmp` are always writable (`sharedTmp`). `resolvePaths`
   (`resolve.go`) owns the rule syntax and the `**` search limits; a rule that makes `/`
-  itself writable fails every launch loudly.
+  itself writable fails every launch loudly. Scoped placement filters unshared candidates
+  before collapsing writable roots, so an unshared ancestor cannot hide a shared repository.
 
 - **Read-only**, each listed by `--explain` and bound over the writable mount so a write
   fails naming the path:
@@ -163,7 +177,7 @@ whether it pays.
   read-only, so a job that would pull, build or remove an image fails with EROFS rather
   than change a store dev never sees.
 
-- **Dev's `/tmp`**: exported beside `/`, so the job's `/tmp` and `/var/tmp` are dev's. The
+- **Dev's `/tmp`**: exported alongside `/var/tmp` beneath the synthetic NFS root. The
   launcher refuses a job when the export lacks `/tmp`. A caller whose `/tmp` is not dev's
   exported one (PrivateTmp, its own tmpfs; `exportedTmpDevice`, `mounts.go`) is kept here
   by `tmpfs`.
@@ -250,9 +264,6 @@ Last the slot: `free-slot` or `where-remote` when a remote has one, else `no-fre
 Two more rules come from the run, not `place`: `remote-unreachable` (a remote that never
 got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 
-- A set `DISPLAY` or `WAYLAND_DISPLAY` refuses nothing; the job's environment on the
-  remote has neither (`envBlock`).
-
 - A script that reaches `/run` or an unexported mount by a relative path or a variable is
   not seen. A lock on no descriptor (mmap only, in flight over a socket) shows only in
   `/proc/locks` and may be missed. A word matched wrongly only keeps the job here.
@@ -308,12 +319,20 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   remotely, failures (non-zero exits, 255 being lost contact) by placement, and the mean
   `cpu_pressure_avg10` of local runs. `summarise` is pure; `--since` is the only flag.
 
-- `apps/claude-user-level/src/rules/offload.md` tells agents to prefix `offload --` to
-  builds, tests and replays over about 30 s of CPU that no runner already offloads. Heavy
-  runners call `offload` themselves; the gate (`scripts/check`, `scripts/ci`) does not, so
-  it never depends on the server. Adopted runner: `apps/session-review/src/review.py` runs
-  `scan.py` through `offload` when `~/.local/bin/offload` exists. Other repositories'
-  runners are tracked as `offload: adopt in <repo> <runner>` issues.
+### Automatic routing in Bash
+
+- `install.sh` copies `scripts/auto.bash` to `~/.local/share/offload/auto.bash`;
+  `uninstall.sh` removes it. To opt in, source it from the Bash startup file used by
+  your terminal, guarded by a file-exists check. Claude Code agent shells can source it
+  through `CLAUDE_ENV_FILE` in a `SessionStart` hook. Install does not edit startup files.
+- The shell routes direct `go build` and `go test` through the existing Offload command
+  with no keyboard input. It passes through redirected input, custom executors, custom
+  test arguments (including unrecognized `go test` flags), `-C`, explicit output flags and
+  nonempty `GOFLAGS`. Use `command go` for a job that needs the local terminal, or
+  `OFFLOAD_AUTO=0` to disable automatic routing.
+- The Bash function is not exported. Other commands, scripts (including `scripts/check`
+  and `scripts/ci`), and explicit `offload --` calls keep their existing behavior. A runner
+  such as `apps/session-review/src/review.py` may still call Offload itself.
 
 ### Health
 
@@ -347,7 +366,7 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   when the command exits. Mount points live under `/run/offload-job.XXXXXX/`, removed with
   `rmdir`, never `rm -r`.
 
-- The launcher mounts dev's `/` read-only, binds each writable path and read-only override
+- The launcher mounts the synthetic NFS root read-only, binds each writable path and read-only override
   from two further mounts of the export, the remote-local paths, an empty `/run` and the
   remote's `/proc`, `/sys`, `/dev`, then `pivot_root`s (never `chroot`: it blocks user
   namespaces) and drops to the caller's uid, gid and supplementary groups (none gets
@@ -367,9 +386,13 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
 
 - The caller's environment never reaches the launcher's root shell: it travels on stdin
   (NUL-terminated entries ended by an empty one; the command line is world-readable on the
-  remote) and is applied by the final `env -i` after `setpriv`. The job's environment is
-  the caller's less `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_*` and the rebound
-  `SSH_AUTH_SOCK`, plus `OFFLOAD_JOB=1`.
+  remote) and is applied by the final `env -i` after `setpriv`. The job drops `DISPLAY`,
+  `WAYLAND_DISPLAY` and `DBUS_*`, rebinds `SSH_AUTH_SOCK`, and adds `OFFLOAD_JOB=1`.
+
+  Scoped placement drops host agent metadata. It keeps a job local if filtering unshared
+  absolute `PATH` entries would change its search path. Go commands stay local when their
+  active persisted Go environment or workspace file is unshared, or their effective environment
+  or working directory cannot be determined. It preserves proxy endpoints.
 
 - Stdin: without `--stdin` the job reads EOF and the caller's stdin is never read, so a
   `while read` loop over `offload` calls keeps its input. `--stdin` appends the caller's

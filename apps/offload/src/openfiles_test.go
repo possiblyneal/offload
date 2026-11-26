@@ -61,7 +61,7 @@ func TestALockDeviceMismatchRefusesUnseenHolder(t *testing.T) {
 	readLocks = func() string { return "" }
 	defer func(f func([]string) ([]openFile, error)) { listAsRoot = f }(listAsRoot)
 	listAsRoot = func([]string) ([]openFile, error) { return nil, nil } // no sudo on a CI runner
-	f, _ := gatherFacts(t.TempDir(), dir, "", []string{"make"}, []string{dir})
+	f, _ := gatherJobFacts(t.TempDir(), dir, "", []string{"make"}, []string{dir}, nil, nil, exportView{})
 	if !strings.Contains(f.Unseen, "0:4242") {
 		t.Fatalf("unseen %q, want the device mismatch named", f.Unseen)
 	}

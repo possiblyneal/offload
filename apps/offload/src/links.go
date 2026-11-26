@@ -155,7 +155,11 @@ func readLinkDir(dir string, dev uint64) (links, subdirs []string, n int, err er
 // directory whose target's directory dev lacks, as build output keeps for the system it
 // builds (`kvm/state -> /run/nanokvm/state`), leads nowhere on dev or in the job's empty
 // private directory, and a job that makes the directory and writes there fails as it ends.
-func cwdLinkRefusal(mounts, links []string) string {
+func cwdLinkRefusal(mounts, links []string, views ...exportView) string {
+	var view exportView
+	if len(views) != 0 {
+		view = views[0]
+	}
 	for _, p := range links {
 		q := realPath(p)
 		if within(privateDirs, q) != "" {
@@ -163,7 +167,7 @@ func cwdLinkRefusal(mounts, links []string) string {
 				continue
 			}
 		}
-		if m := within(mounts, q); m != "" {
+		if m := view.missing(mounts, q); m != "" {
 			return fmt.Sprintf("link %s leads onto dev's %s mount, which is not exported", p, m)
 		}
 		if m := holding(mounts, q); m != "" {

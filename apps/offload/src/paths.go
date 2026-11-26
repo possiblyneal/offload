@@ -10,20 +10,25 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
 
 // jobPathsFor resolves the writable and read-only paths from the Operator's Claude
 // Code settings. Missing settings mean no rules: the job's repository alone is writable.
-func jobPathsFor(home string, repos []string) (jobPaths, error) {
+func jobPathsFor(home string, repos, mounts []string, view exportView) (jobPaths, error) {
+	var excluded func(string) bool
+	if view.root != "" {
+		excluded = func(p string) bool { return view.excludesWritable(mounts, p) }
+	}
 	settings, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		settings = []byte("{}")
 	} else if err != nil {
 		return jobPaths{}, err
 	}
-	return resolvePaths(settings, home, repos, os.DirFS("/"))
+	return resolvePathsFiltered(settings, home, repos, os.DirFS("/"), excluded)
 }
 
 // remoteLocalPath is a configured tool-cache path, under home, that the launcher binds from
@@ -318,9 +323,13 @@ var envExempt = map[string]bool{"DISPLAY": true, "WAYLAND_DISPLAY": true, "XAUTH
 // unexported mount (a shell script's `> /dev/shm/out`, GOCOVERDIR=/tmp/c) refuses too:
 // running here loses nothing.
 func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string {
+	return tmpRefusalIn(mounts, cwd, env, argv, exportView{})
+}
+
+func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view exportView) string {
 	check := func(what, p string) string {
 		for _, q := range []string{filepath.Clean(p), realPath(p)} {
-			if m := within(mounts, q); m != "" {
+			if m := view.missing(mounts, q); m != "" {
 				return fmt.Sprintf("%s %s is on dev's %s mount, which is not exported", what, p, m)
 			}
 			if m := within(privateDirs, q); m != "" {
@@ -333,12 +342,113 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		return ""
 	}
 	home := scriptHome(env)
+	overriddenGoEnv := map[string]bool{}
+	if view.root != "" && findCommand(argv, func(cmd []string) string {
+		if filepath.Base(cmd[0]) == "go" {
+			return "go"
+		}
+		return ""
+	}) != "" {
+		var goenv, xdg, gowork string
+		goHome := home
+		for _, entry := range env {
+			name, value, _ := strings.Cut(entry, "=")
+			switch name {
+			case "GOENV":
+				goenv = value
+			case "XDG_CONFIG_HOME":
+				xdg = value
+			case "GOWORK":
+				gowork = value
+			}
+		}
+		words := argv
+		for len(words) > 0 && isAssignment(words[0]) {
+			name, value, _ := strings.Cut(words[0], "=")
+			switch name {
+			case "GOENV":
+				goenv = value
+				overriddenGoEnv[name] = true
+			case "XDG_CONFIG_HOME":
+				xdg = value
+				overriddenGoEnv[name] = true
+			case "HOME":
+				goHome = value
+				overriddenGoEnv[name] = true
+			case "GOWORK":
+				gowork = value
+				overriddenGoEnv[name] = true
+			}
+			words = words[1:]
+		}
+		if len(words) == 0 || filepath.Base(words[0]) != "go" {
+			return "cannot determine the Go command's configuration or working directory"
+		}
+		if slices.ContainsFunc(words[1:], func(w string) bool {
+			return w == "-C" || strings.HasPrefix(w, "-C=") || w == "--C" || strings.HasPrefix(w, "--C=")
+		}) {
+			return "cannot determine the Go command's working directory"
+		}
+		if goenv == "" {
+			if xdg == "" {
+				goenv = filepath.Join(goHome, ".config", "go", "env")
+			} else if filepath.IsAbs(xdg) {
+				goenv = filepath.Join(xdg, "go", "env")
+			}
+			// On Unix, Go does not use a user config file for a relative XDG_CONFIG_HOME.
+		}
+		if goenv != "" && goenv != "off" {
+			if !filepath.IsAbs(goenv) {
+				goenv = filepath.Join(cwd, goenv)
+			}
+			if _, err := os.Stat(goenv); err == nil {
+				if reason := check("Go configuration", goenv); reason != "" {
+					return reason
+				}
+				if gowork == "" {
+					data, err := os.ReadFile(goenv)
+					if err != nil {
+						return "cannot read Go configuration " + goenv
+					}
+					for _, line := range strings.Split(string(data), "\n") {
+						if value, ok := strings.CutPrefix(line, "GOWORK="); ok {
+							gowork = value
+						}
+					}
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return "cannot inspect Go configuration " + goenv
+			}
+		}
+		if gowork == "" || gowork == "auto" {
+			for dir := cwd; ; dir = filepath.Dir(dir) {
+				candidate := filepath.Join(dir, "go.work")
+				if _, err := os.Stat(candidate); err == nil {
+					gowork = candidate
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return "cannot inspect Go workspace " + candidate
+				}
+				if parent := filepath.Dir(dir); parent == dir {
+					break
+				}
+			}
+		}
+		if gowork != "" && gowork != "auto" && gowork != "off" {
+			if !filepath.IsAbs(gowork) {
+				return "cannot determine the Go workspace path " + gowork
+			}
+			if reason := check("Go workspace", gowork); reason != "" {
+				return reason
+			}
+		}
+	}
 	mentions := func(s string) string {
 		s = squashPath(s)
 		if d := namesDir(s, append(privateDirs, runAliases...)); d != "" {
 			return d + ", which the job sees as a private directory removed when it ends"
 		}
-		if m := namesDir(s, mounts); m != "" {
+		if m := namesDir(s, mounts); view.root == "" && m != "" {
 			return "dev's " + m + " mount, which is not exported"
 		}
 		return ""
@@ -356,7 +466,7 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 	// Every job may write /tmp and /var/tmp; when either is a mount the export does not
 	// carry (a PrivateTmp service's), a remote job's files land where the caller cannot see.
 	for _, t := range sharedTmp {
-		if m := within(mounts, t); m != "" {
+		if m := view.missing(mounts, t); m != "" {
 			return fmt.Sprintf("%s is on dev's %s mount, which is not exported", t, m)
 		}
 	}
@@ -368,6 +478,9 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 	}
 	for _, e := range env {
 		name, v, _ := strings.Cut(e, "=")
+		if overriddenGoEnv[name] {
+			continue
+		}
 		if name == "TMPDIR" {
 			p := v
 			if p != "" && !filepath.IsAbs(p) {
@@ -380,10 +493,22 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		if envExempt[name] || strings.HasPrefix(name, "DBUS_") {
 			continue
 		}
+		switch strings.ToUpper(name) {
+		case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY":
+			if u, err := url.Parse(v); err == nil && u.Scheme != "" && u.Host != "" && (u.Path == "" || u.Path == "/") {
+				continue // The proxy endpoint is a network address, not a file path.
+			}
+		}
 		if r := mentions(v); r != "" {
 			return name + " names " + r
 		}
-		if r := scriptRefusal(mounts, readArg(v, cwd, home).written, false); r != "" {
+		written := readArg(v, cwd, home).written
+		if view.root != "" {
+			written = slices.DeleteFunc(written, func(p string) bool {
+				return name == "HOME" && p == view.home || within(view.caches, p) != ""
+			})
+		}
+		if r := scriptRefusal(mounts, written, false, view); r != "" {
 			return name + " names " + r
 		}
 	}
@@ -408,7 +533,7 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 		if r := mentions(a); r != "" {
 			return fmt.Sprintf("argument %q names %s", a, r)
 		}
-		if r := scriptRefusal(mounts, ap.written, true); r != "" {
+		if r := scriptRefusal(mounts, ap.written, true, view); r != "" {
 			return fmt.Sprintf("argument %q names %s", a, r)
 		}
 	}
@@ -420,14 +545,14 @@ func tmpRefusal(mounts []string, cwd string, env []string, argv []string) string
 // a private directory, naming dev's own machine, or, with holds, holding an unexported
 // mount; or "". An environment value is judged without holds: HOME and PATH hold every
 // mount below them, and a job that walks one is told so in its arguments.
-func scriptRefusal(mounts []string, written []string, holds bool) string {
+func scriptRefusal(mounts []string, written []string, holds bool, view exportView) string {
 	for _, p := range written {
 		for _, q := range []string{p, realPath(p)} {
 			at := p
 			if q != p {
 				at = p + " (" + q + ")"
 			}
-			if m := within(mounts, q); m != "" {
+			if m := view.missing(mounts, q); m != "" {
 				return at + ", on dev's " + m + " mount, which is not exported"
 			}
 			if d := within(append(privateDirs, runAliases...), q); d != "" {

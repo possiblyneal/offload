@@ -22,6 +22,7 @@ type job struct {
 	repo    string // git toplevel of cwd, or "" when cwd is in no repository
 	cwd     string
 	argv    []string
+	env     []string
 
 	writable []string // bound read-write from dev
 	readOnly []string // inside writable, bound read-only again

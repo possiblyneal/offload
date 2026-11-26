@@ -178,7 +178,7 @@ func TestGatherFactsRefusesACwdItCannotWalkForLinks(t *testing.T) {
 	}
 	defer func(n int) { linkWalkLimit = n }(linkWalkLimit)
 	linkWalkLimit = 2
-	if f, _ := gatherFacts(t.TempDir(), cwd, "", []string{"make"}, []string{cwd}); !strings.Contains(f.Tmpfs, "more than 2") {
+	if f, _ := gatherJobFacts(t.TempDir(), cwd, "", []string{"make"}, []string{cwd}, nil, nil, exportView{}); !strings.Contains(f.Tmpfs, "more than 2") {
 		t.Errorf("Tmpfs %q, want the walk's limit named", f.Tmpfs)
 	}
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -254,5 +256,57 @@ func TestUnderAndCollapseTreatTheRootAsHoldingEverything(t *testing.T) {
 	}
 	if got := collapse([]string{"/tmp", "/", "/var/tmp"}); !reflect.DeepEqual(got, []string{"/"}) {
 		t.Errorf("collapse = %v, want [/]", got)
+	}
+}
+
+func TestScopedFilteringKeepsRepositoryAndDenyUnderUnsharedAncestor(t *testing.T) {
+	repo := home + "/code/repo"
+	denied := repo + "/secret"
+	fsys := tree(denied)
+	view := exportView{root: "/synthetic", shared: []string{home + "/code", "/tmp", "/var/tmp"}}
+	excluded := func(p string) bool { return view.excludesWritable(nil, p) }
+	paths, err := resolvePathsFiltered(settings([]string{"Edit(~/**)"}, []string{"Edit(~/code/repo/secret)"}), home, []string{repo}, fsys, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolvePathsFiltered(settings([]string{"Edit(//**)"}, nil), home, []string{repo}, fsys, excluded); err == nil {
+		t.Error("root guard lost")
+	}
+	if !slices.Contains(paths.writable, repo) {
+		t.Errorf("repository not writable: %v", paths.writable)
+	}
+	if !slices.Contains(paths.readOnly, denied) {
+		t.Errorf("deny lost: %v", paths.readOnly)
+	}
+}
+
+func TestJobPathsForScopedRepositoryAndDeny(t *testing.T) {
+	home := t.TempDir()
+	repo := filepath.Join(home, "code", "repo")
+	denied := filepath.Join(repo, "secret")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(denied, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), settings([]string{"Edit(~/**)"}, []string{"Edit(~/code/repo/secret)"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := exportView{root: "/synthetic", shared: []string{filepath.Join(home, "code"), "/var/tmp"}}
+	// Model the unshared home mount hiding the /tmp share except for the verified code bind.
+	mounts := []string{home}
+	paths, err := jobPathsFor(home, []string{repo}, mounts, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(paths.writable, repo) {
+		t.Errorf("repository not writable: %v", paths.writable)
+	}
+	if !slices.Contains(paths.readOnly, denied) {
+		t.Errorf("deny lost: %v", paths.readOnly)
 	}
 }

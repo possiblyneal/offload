@@ -42,6 +42,10 @@ type jobPaths struct {
 // path is relative to home, the folder holding the settings file. Dev's /tmp and /var/tmp
 // are always writable (sharedTmp), as they are to a local run.
 func resolvePaths(settingsJSON []byte, home string, repos []string, fsys fs.FS) (jobPaths, error) {
+	return resolvePathsFiltered(settingsJSON, home, repos, fsys, nil)
+}
+
+func resolvePathsFiltered(settingsJSON []byte, home string, repos []string, fsys fs.FS, excluded func(string) bool) (jobPaths, error) {
 	var s struct {
 		Permissions struct {
 			Allow []string `json:"allow"`
@@ -73,7 +77,11 @@ func resolvePaths(settingsJSON []byte, home string, repos []string, fsys fs.FS) 
 		// on every launch.
 		return jobPaths{}, errors.New("an Edit rule makes / writable; offload cannot bound its deny search, so narrow the rule")
 	}
-	writable = collapse(append(writable, sharedTmp...))
+	writable = append(writable, sharedTmp...)
+	if excluded != nil {
+		writable = slices.DeleteFunc(writable, excluded)
+	}
+	writable = collapse(writable)
 
 	var readOnly []string
 	for _, rule := range s.Permissions.Deny {
