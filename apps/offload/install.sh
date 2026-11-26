@@ -35,9 +35,11 @@ scoped_wrapper() {
       return 1
     fi
   done <<<"$metadata"
-  [[ -n $flags && $flags != *\\* && $flags != *\'* && $flags != *\"* ]] || return 1
+  [[ -n $flags && $flags != *\\* && $flags != *\"* ]] || return 1
   read -r -a words <<<"$flags"
   for token in "${words[@]}"; do
+    # Go treats a single quote as quoting only at the start of a field.
+    [[ $token != \'* ]] || return 1
     if [[ $token == *main.scopedExportRoot* ]]; then
       [[ $next == 1 && $token == main.scopedExportRoot=/run/offload-export ]] || return 1
       ((count += 1))

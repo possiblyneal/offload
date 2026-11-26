@@ -17,7 +17,11 @@ import (
 
 // jobPathsFor resolves the writable and read-only paths from the Operator's Claude
 // Code settings. Missing settings mean no rules: the job's repository alone is writable.
-func jobPathsFor(home string, repos []string, excluded func(string) bool) (jobPaths, error) {
+func jobPathsFor(home string, repos, mounts []string, view exportView) (jobPaths, error) {
+	var excluded func(string) bool
+	if view.root != "" {
+		excluded = func(p string) bool { return view.excludesWritable(mounts, p) }
+	}
 	settings, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		settings = []byte("{}")
@@ -345,7 +349,7 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 		}
 		return ""
 	}) != "" {
-		var goenv, xdg string
+		var goenv, xdg, gowork string
 		goHome := home
 		for _, entry := range env {
 			name, value, _ := strings.Cut(entry, "=")
@@ -354,6 +358,8 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 				goenv = value
 			case "XDG_CONFIG_HOME":
 				xdg = value
+			case "GOWORK":
+				gowork = value
 			}
 		}
 		words := argv
@@ -369,19 +375,29 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 			case "HOME":
 				goHome = value
 				overriddenGoEnv[name] = true
+			case "GOWORK":
+				gowork = value
+				overriddenGoEnv[name] = true
 			}
 			words = words[1:]
 		}
 		if len(words) == 0 || filepath.Base(words[0]) != "go" {
 			return "cannot determine the Go command's configuration or working directory"
 		}
+		if slices.ContainsFunc(words[1:], func(w string) bool {
+			return w == "-C" || strings.HasPrefix(w, "-C=") || w == "--C" || strings.HasPrefix(w, "--C=")
+		}) {
+			return "cannot determine the Go command's working directory"
+		}
 		if goenv == "" {
 			if xdg == "" {
-				xdg = filepath.Join(goHome, ".config")
+				goenv = filepath.Join(goHome, ".config", "go", "env")
+			} else if filepath.IsAbs(xdg) {
+				goenv = filepath.Join(xdg, "go", "env")
 			}
-			goenv = filepath.Join(xdg, "go", "env")
+			// On Unix, Go does not use a user config file for a relative XDG_CONFIG_HOME.
 		}
-		if goenv != "off" {
+		if goenv != "" && goenv != "off" {
 			if !filepath.IsAbs(goenv) {
 				goenv = filepath.Join(cwd, goenv)
 			}
@@ -389,8 +405,41 @@ func tmpRefusalIn(mounts []string, cwd string, env []string, argv []string, view
 				if reason := check("Go configuration", goenv); reason != "" {
 					return reason
 				}
+				if gowork == "" {
+					data, err := os.ReadFile(goenv)
+					if err != nil {
+						return "cannot read Go configuration " + goenv
+					}
+					for _, line := range strings.Split(string(data), "\n") {
+						if value, ok := strings.CutPrefix(line, "GOWORK="); ok {
+							gowork = value
+						}
+					}
+				}
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return "cannot inspect Go configuration " + goenv
+			}
+		}
+		if gowork == "" || gowork == "auto" {
+			for dir := cwd; ; dir = filepath.Dir(dir) {
+				candidate := filepath.Join(dir, "go.work")
+				if _, err := os.Stat(candidate); err == nil {
+					gowork = candidate
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return "cannot inspect Go workspace " + candidate
+				}
+				if parent := filepath.Dir(dir); parent == dir {
+					break
+				}
+			}
+		}
+		if gowork != "" && gowork != "auto" && gowork != "off" {
+			if !filepath.IsAbs(gowork) {
+				return "cannot determine the Go workspace path " + gowork
+			}
+			if reason := check("Go workspace", gowork); reason != "" {
+				return reason
 			}
 		}
 	}

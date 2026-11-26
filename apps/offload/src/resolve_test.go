@@ -299,7 +299,7 @@ func TestJobPathsForScopedRepositoryAndDeny(t *testing.T) {
 	view := exportView{root: "/synthetic", shared: []string{filepath.Join(home, "code"), "/var/tmp"}}
 	// Model the unshared home mount hiding the /tmp share except for the verified code bind.
 	mounts := []string{home}
-	paths, err := jobPathsFor(home, []string{repo}, func(p string) bool { return view.excludesWritable(mounts, p) })
+	paths, err := jobPathsFor(home, []string{repo}, mounts, view)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -490,8 +490,8 @@ func TestAnOutputFileAnotherProcessLocksKeepsTheJobHere(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd := exec.Command("sh", "-c", `exec "$0" >"$1"`, os.Args[0], out.Name())
 	cmd.Dir = t.TempDir()
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir(), "OFFLOAD_TEST_CONFIG=" + config,
-		"OFFLOAD_TEST_RUN=--\x1ftrue"}
+	cmd.Env = append(testProxyEnv(), "PATH=/usr/bin:/bin", "HOME="+t.TempDir(), "OFFLOAD_TEST_CONFIG="+config,
+		"OFFLOAD_TEST_RUN=--\x1ftrue")
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("%v: %s", err, stderr.String())

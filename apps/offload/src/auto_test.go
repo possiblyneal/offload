@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+func testProxyEnv() []string {
+	var proxies []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch strings.ToUpper(name) {
+		case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
+			proxies = append(proxies, entry)
+		}
+	}
+	return proxies
+}
+
 func TestBashAutomaticRouting(t *testing.T) {
 	adapter, err := filepath.Abs("../scripts/auto.bash")
 	if err != nil {
@@ -19,7 +31,7 @@ func TestBashAutomaticRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
-		"go": `if [ "$1" = env ]; then printf '%s\n' "$GOFLAGS"; exit; fi
+		"go": `if [ "$1" = env ]; then [ -z "${PROBE_FILE-}" ] || : >"$PROBE_FILE"; printf '%s\n' "$GOFLAGS"; exit; fi
 printf 'go'; printf ' <%s>' "$@"; printf '\n'`,
 		"offload": `printf 'offload'; printf ' <%s>' "$@"; printf '\n'; exit 42`,
 	} {
@@ -32,6 +44,7 @@ printf 'go'; printf ' <%s>' "$@"; printf '\n'`,
 		code                int
 	}{
 		{"build", `go build './with space' </dev/null`, "offload <--> <" + bin + "/go> <build> <./with space>", 42},
+		{"change directory", `go build -C target </dev/null`, "go <build> <-C> <target>", 0},
 		{"test", `go test ./... </dev/null`, "offload <--> <" + bin + "/go> <test> <./...>", 42},
 		{"other command", `go version </dev/null`, "go <version>", 0},
 		{"pipe", `printf input | go test`, "go <test>", 0},
@@ -56,9 +69,15 @@ printf 'go'; printf ' <%s>' "$@"; printf '\n'`,
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := exec.Command("/bin/bash", "-c", `. "$1"; `+tt.command, "bash", adapter)
-			cmd.Env = []string{"HOME=" + home, "PATH=" + bin}
+			probe := filepath.Join(t.TempDir(), "probe")
+			cmd.Env = append(testProxyEnv(), "HOME="+home, "PATH="+bin, "PROBE_FILE="+probe)
 			out, err := cmd.CombinedOutput()
 			code := exitStatus(t, err)
+			if tt.name == "change directory" {
+				if _, err := os.Stat(probe); !os.IsNotExist(err) {
+					t.Errorf("go env ran before -C: %v", err)
+				}
+			}
 			if code != tt.code || strings.TrimSpace(string(out)) != tt.want {
 				t.Fatalf("got %q (exit %d, %v), want %q (exit %d)", out, code, err, tt.want, tt.code)
 			}

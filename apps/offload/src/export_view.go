@@ -80,6 +80,15 @@ func (v exportView) excludesWritable(mounts []string, p string) bool {
 		within([]string{"/etc", "/usr"}, realPath(p)) != ""
 }
 
+func pathFilterRefusal(original, filtered []string) string {
+	for _, entry := range original {
+		if strings.HasPrefix(entry, "PATH=") && !slices.Contains(filtered, entry) {
+			return "the scoped export would change PATH"
+		}
+	}
+	return ""
+}
+
 func (v exportView) environment(env, mounts []string) []string {
 	if v.root == "" {
 		return env

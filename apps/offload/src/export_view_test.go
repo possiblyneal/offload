@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -37,5 +38,25 @@ done
 	cmd.ExtraFiles = []*os.File{viewScript}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("restricted export view: %v\n%s", err, out)
+	}
+}
+
+func TestScopedPathFilteringRequiresLocalPlacement(t *testing.T) {
+	home := t.TempDir()
+	shared := filepath.Join(home, "code")
+	private := filepath.Join(home, "bin")
+	view := exportView{root: "/synthetic", home: home, shared: []string{shared, "/tmp", "/var/tmp"}}
+	mounts := []string{home}
+	for _, c := range []struct {
+		path   string
+		refuse bool
+	}{
+		{private + ":" + shared, true}, {shared, false}, {".", false},
+	} {
+		env := []string{"PATH=" + c.path}
+		scoped := view.environment(env, mounts)
+		if got := pathFilterRefusal(env, scoped); (got != "") != c.refuse {
+			t.Errorf("PATH %q: refusal %q, want %v", c.path, got, c.refuse)
+		}
 	}
 }

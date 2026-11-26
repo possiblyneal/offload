@@ -734,10 +734,10 @@ func TestScopedGoConfigRefusal(t *testing.T) {
 	if err := os.WriteFile(config, []byte("GOPROXY=off\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	view := exportView{root: "/synthetic", shared: []string{"/tmp", "/var/tmp"}}
-	mounts := []string{filepath.Dir(config)}
-	env := []string{"HOME=" + home}
 	cwd := t.TempDir()
+	view := exportView{root: "/synthetic", shared: []string{home, cwd, "/tmp", "/var/tmp"}}
+	mounts := []string{filepath.Dir(config)}
+	env := []string{"HOME=" + home, "GOWORK=off"}
 	if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test", "./..."}, view); !strings.Contains(got, config) {
 		t.Errorf("active Go config: %q", got)
 	}
@@ -773,25 +773,26 @@ func TestGoConfigUsesEffectiveEnvironment(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	view := exportView{root: "/synthetic", home: home, shared: []string{"/tmp", "/var/tmp"}}
+	view := exportView{root: "/synthetic", home: home, shared: []string{base, "/tmp", "/var/tmp"}}
 	mounts := []string{home, private}
 	cases := []struct {
 		name      string
 		env, argv []string
-		refuse    bool
+		want      string
 	}{
-		{"inline off", []string{"HOME=" + home}, []string{"GOENV=off", "go", "test"}, false},
-		{"inline off overrides inherited", []string{"HOME=" + home, "GOENV=" + filepath.Join(private, "env")}, []string{"GOENV=off", "go", "test"}, false},
-		{"relative inherited", []string{"HOME=" + home, "GOENV=../private/env"}, []string{"go", "test"}, true},
-		{"inline off inherited", []string{"HOME=" + home, "GOENV=off"}, []string{"GOENV=../private/env", "go", "test"}, true},
-		{"inline xdg", []string{"HOME=" + home}, []string{"XDG_CONFIG_HOME=" + cwd, "go", "test"}, false},
-		{"shell unknown", []string{"HOME=" + home, "GOENV=off"}, []string{"sh", "-c", "cd ../private && GOENV=env go test"}, true},
+		{"inline off", []string{"HOME=" + home}, []string{"GOENV=off", "go", "test"}, ""},
+		{"inline off overrides inherited", []string{"HOME=" + home, "GOENV=" + filepath.Join(private, "env")}, []string{"GOENV=off", "go", "test"}, ""},
+		{"relative inherited", []string{"HOME=" + home, "GOENV=../private/env"}, []string{"go", "test"}, "Go configuration " + filepath.Join(private, "env")},
+		{"inline on overrides inherited off", []string{"HOME=" + home, "GOENV=off"}, []string{"GOENV=../private/env", "go", "test"}, "Go configuration " + filepath.Join(private, "env")},
+		{"inline xdg", []string{"HOME=" + home}, []string{"XDG_CONFIG_HOME=" + cwd, "go", "test"}, ""},
+		{"relative xdg", []string{"HOME=" + home, "XDG_CONFIG_HOME=../home/.config"}, []string{"go", "test"}, ""},
+		{"shell unknown", []string{"HOME=" + home, "GOENV=off"}, []string{"sh", "-c", "cd ../private && GOENV=env go test"}, "cannot determine the Go command's configuration"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := tmpRefusalIn(mounts, cwd, c.env, c.argv, view)
-			if (got != "") != c.refuse {
-				t.Errorf("refusal %q, want refusal %v", got, c.refuse)
+			got := tmpRefusalIn(mounts, cwd, append(c.env, "GOWORK=off"), c.argv, view)
+			if c.want == "" && got != "" || c.want != "" && !strings.Contains(got, c.want) {
+				t.Errorf("refusal %q, want %q", got, c.want)
 			}
 		})
 	}
@@ -812,9 +813,9 @@ func TestInheritedGoConfigOverridesDefault(t *testing.T) {
 			if err := os.WriteFile(config, []byte("GOPROXY=off\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			view := exportView{root: "/synthetic", home: home, shared: []string{"/tmp", "/var/tmp"}}
+			view := exportView{root: "/synthetic", home: home, shared: []string{base, "/tmp", "/var/tmp"}}
 			mounts := []string{config}
-			env := []string{"HOME=" + home}
+			env := []string{"HOME=" + home, "GOWORK=off"}
 			if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test"}, view); got != "" {
 				t.Fatalf("default config should allow placement: %q", got)
 			}
@@ -827,5 +828,70 @@ func TestInheritedGoConfigOverridesDefault(t *testing.T) {
 				t.Errorf("inherited %s should refuse for %s, got %q", name, config, got)
 			}
 		})
+	}
+}
+
+func TestScopedGoWorkspacePlacement(t *testing.T) {
+	base := t.TempDir()
+	cwd := filepath.Join(base, "code", "app")
+	work := filepath.Join(base, "go.work")
+	if err := os.MkdirAll(cwd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(work, []byte("go 1.23\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := exportView{root: "/synthetic", home: base, shared: []string{filepath.Join(base, "code"), "/tmp", "/var/tmp"}}
+	mounts := []string{base}
+	env := []string{"HOME=" + base, "GOENV=off"}
+	cases := []struct {
+		name      string
+		env, argv []string
+		refuse    bool
+	}{
+		{"implicit ancestor", env, []string{"go", "test"}, true},
+		{"explicit off", append(slices.Clone(env), "GOWORK=off"), []string{"go", "test"}, false},
+		{"inline off", env, []string{"GOWORK=off", "go", "test"}, false},
+		{"inline off overrides inherited", append(slices.Clone(env), "GOWORK="+work), []string{"GOWORK=off", "go", "test"}, false},
+		{"explicit unshared", append(slices.Clone(env), "GOWORK="+work), []string{"go", "test"}, true},
+		{"uncertain cwd", env, []string{"go", "-C", cwd, "test"}, true},
+		{"double dash cwd", append(slices.Clone(env), "GOWORK=off"), []string{"go", "build", "--C=" + cwd}, true},
+		{"double dash cwd separate", append(slices.Clone(env), "GOWORK=off"), []string{"go", "build", "--C", cwd}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := tmpRefusalIn(mounts, cwd, c.env, c.argv, view)
+			if (got != "") != c.refuse {
+				t.Errorf("refusal %q, want refusal %v", got, c.refuse)
+			}
+		})
+	}
+	alternate := filepath.Join(base, "other", "go.work")
+	config := filepath.Join(base, "code", "go-env")
+	if err := os.MkdirAll(filepath.Dir(alternate), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alternate, []byte("go 1.23\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("GOWORK="+alternate+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	persistedEnv := []string{"HOME=" + base, "GOENV=" + config}
+	if got := tmpRefusalIn(mounts, cwd, persistedEnv, []string{"go", "test"}, view); !strings.Contains(got, alternate) {
+		t.Errorf("persisted unshared workspace: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, append(slices.Clone(persistedEnv), "GOWORK=off"), []string{"go", "test"}, view); got != "" {
+		t.Errorf("GOWORK=off overrides persisted workspace: %q", got)
+	}
+	sharedWork := filepath.Join(cwd, "go.work")
+	if err := os.WriteFile(sharedWork, []byte("go 1.23\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := tmpRefusalIn(mounts, cwd, env, []string{"go", "test"}, view); got != "" {
+		t.Errorf("nearest shared workspace: %q", got)
+	}
+	if got := tmpRefusalIn(mounts, cwd, append(slices.Clone(env), "GOWORK="+sharedWork), []string{"go", "test"}, view); got != "" {
+		t.Errorf("explicit shared workspace: %q", got)
 	}
 }

@@ -327,7 +327,7 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   through `CLAUDE_ENV_FILE` in a `SessionStart` hook. Install does not edit startup files.
 - The shell routes direct `go build` and `go test` through the existing Offload command
   with no keyboard input. It passes through redirected input, custom executors, custom
-  test arguments (including unrecognized `go test` flags), explicit output flags and
+  test arguments (including unrecognized `go test` flags), `-C`, explicit output flags and
   nonempty `GOFLAGS`. Use `command go` for a job that needs the local terminal, or
   `OFFLOAD_AUTO=0` to disable automatic routing.
 - The Bash function is not exported. Other commands, scripts (including `scripts/check`
@@ -389,10 +389,10 @@ got `go`) and `jobs-lock` (the sweep lock could not be shared in time).
   remote) and is applied by the final `env -i` after `setpriv`. The job drops `DISPLAY`,
   `WAYLAND_DISPLAY` and `DBUS_*`, rebinds `SSH_AUTH_SOCK`, and adds `OFFLOAD_JOB=1`.
 
-  Scoped placement also drops host agent metadata and unshared absolute `PATH` entries.
-  Go commands stay local when their active persisted Go environment file exists but is not shared;
-  Go commands behind wrappers or scripts stay local when their effective environment is uncertain.
-  It checks tool-specific file paths and preserves proxy endpoints.
+  Scoped placement drops host agent metadata. It keeps a job local if filtering unshared
+  absolute `PATH` entries would change its search path. Go commands stay local when their
+  active persisted Go environment or workspace file is unshared, or their effective environment
+  or working directory cannot be determined. It preserves proxy endpoints.
 
 - Stdin: without `--stdin` the job reads EOF and the caller's stdin is never read, so a
   `while read` loop over `offload` calls keeps its input. `--stdin` appends the caller's

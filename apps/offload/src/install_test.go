@@ -516,6 +516,8 @@ func TestExportOnlyChecksUnambiguousScopedMetadata(t *testing.T) {
 		allow       bool
 	}{
 		{"first", "-X main.scopedExportRoot=/run/offload-export -X main.configDir=/fixture", true},
+		{"apostrophe in config path", "-X main.configDir=/fixture/O'Brien/config -X main.scopedExportRoot=/run/offload-export", true},
+		{"quoted field", "'-X main.scopedExportRoot=/other' -X main.scopedExportRoot=/run/offload-export", false},
 		{"duplicate empty", "-X main.configDir=/fixture -X main.scopedExportRoot=/run/offload-export -X main.scopedExportRoot=", false},
 		{"duplicate same", "-X main.scopedExportRoot=/run/offload-export -X main.scopedExportRoot=/run/offload-export", false},
 	} {

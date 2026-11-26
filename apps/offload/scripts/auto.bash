@@ -24,7 +24,7 @@ go() {
       flag=${arg%%=*}
       # Keep custom executors and explicit output paths local for either command.
       case ${flag#test.} in
-        '' | exec | toolexec | args | o | *profile | outputdir | trace)
+        '' | C | exec | toolexec | args | o | *profile | outputdir | trace)
           command go "$@"
           return
           ;;
