@@ -194,9 +194,22 @@ REMOTE
   echo "offload: ${remote_names[$i]} (${remote_addrs[$i]}) ready"
 done
 
-# dev: the command. The config path is baked in so the binary finds it from anywhere.
+# dev: the config, copied out of the checkout, and the command. The command bakes in the
+# copy's path, so it finds its config from anywhere and keeps working when the checkout
+# that built it is switched, rebuilt or removed. The checkout stays the source of truth:
+# every run overwrites the copy, so config edits are made in the checkout (offload.conf,
+# which holds the deployment's addresses, stays private to the account).
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/offload"
+install -d -m 0755 "$CONFIG_DIR"
+for f in "$UNIT"/config/*; do
+  case ${f##*/} in
+    *.example) ;;
+    offload.conf) install -m 0600 "$f" "$CONFIG_DIR/offload.conf" ;;
+    *) install -m 0644 "$f" "$CONFIG_DIR/${f##*/}" ;;
+  esac
+done
 mkdir -p "$HOME/.local/bin"
-(cd "$UNIT/src" && go build -ldflags "-X main.configDir=$UNIT/config -X main.scopedExportRoot=/run/offload-export" -o "$HOME/.local/bin/offload" .)
+(cd "$UNIT/src" && go build -ldflags "-X main.configDir=$CONFIG_DIR -X main.scopedExportRoot=/run/offload-export" -o "$HOME/.local/bin/offload" .)
 echo "offload: installed $HOME/.local/bin/offload"
 install -Dm0644 "$UNIT/scripts/auto.bash" "$HOME/.local/share/offload/auto.bash"
 
