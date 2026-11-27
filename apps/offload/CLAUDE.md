@@ -74,6 +74,10 @@ whether it pays.
   `offload health --notify` at `:05` and `:35`; `install.sh` copies them into
   `~/.config/systemd/user/` and enables the timer, `uninstall.sh` removes them
 
+- `install.sh` copies `config/` (not the `.example`) to `${XDG_CONFIG_HOME:-~/.config}/offload/`, `offload.conf`
+  at mode 0600, and bakes that path into the command as `main.configDir`, so the command reads no
+  checkout. Every install overwrites the copy: edit config in the checkout and rerun `install.sh`;
+  `uninstall.sh` removes the copy
 - `install.sh`, `uninstall.sh` — one command each, idempotent; `install.sh --export-only`
   applies dev's export and nfsd tuning without touching the remotes or the command, and
   `scripts/remotes.sh` (sourced) reads and validates an `offload.conf`, refuses while a

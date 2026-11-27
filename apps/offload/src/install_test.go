@@ -140,6 +140,12 @@ func install(t *testing.T, mode, pre string) (code int, stdout, stderr string, c
 // pushed remote files landed under.
 func installIn(t *testing.T, mode, pre string, args ...string) (code int, stdout, stderr string, calls []string, root string) {
 	t.Helper()
+	return installAt(t, t.TempDir(), mode, pre, args...)
+}
+
+// installAt is installIn with the account's home given, to read what install put there.
+func installAt(t *testing.T, home, mode, pre string, args ...string) (code int, stdout, stderr string, calls []string, root string) {
+	t.Helper()
 	root = t.TempDir()
 	needNamespaces(t, "-rn", "/usr/sbin/nft list ruleset")
 	bin, log := fakeInstallTools(t)
@@ -147,7 +153,7 @@ func installIn(t *testing.T, mode, pre string, args ...string) (code int, stdout
 	cmd := exec.Command("unshare", append([]string{"-rn", "sh", "-c",
 		`printf '%s' "$1" | /usr/sbin/nft -f /dev/stdin || exit 99; shift; "$@"; rc=$?; echo '--- ruleset'; /usr/sbin/nft list ruleset; exit $rc`,
 		"sh", pre, script}, args...)...)
-	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+t.TempDir(), "FAKE_SSH="+mode, "FAKE_LOG="+log, "FAKE_ROOT="+root)
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+home, "FAKE_SSH="+mode, "FAKE_LOG="+log, "FAKE_ROOT="+root)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	code = exitStatus(t, cmd.Run())
@@ -391,6 +397,35 @@ func TestInstallReplacesEachRemoteFileByRename(t *testing.T) {
 		if !staged || !renamed {
 			t.Errorf("%s was not pushed by rename (calls %q)", dest, calls)
 		}
+	}
+}
+
+// The command reads its config from a copy outside the checkout, so it keeps working after
+// the checkout that built it is switched or removed.
+func TestInstallBakesInAConfigCopyOutsideTheCheckout(t *testing.T) {
+	home := t.TempDir()
+	code, _, stderr, calls, _ := installAt(t, home, "idle", "")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	dir := filepath.Join(home, ".config/offload")
+	built := false
+	for _, c := range calls {
+		if strings.HasPrefix(c, "go build") && strings.Contains(c, "-X main.configDir="+dir+" ") {
+			built = true
+		}
+	}
+	if !built {
+		t.Errorf("no go build bakes in configDir %s; calls %q", dir, calls)
+	}
+	for name, mode := range map[string]os.FileMode{"offload.conf": 0o600, "remote-local-paths": 0o644, "offload-net.nft": 0o644} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.Mode().Perm() != mode {
+			t.Errorf("%s: %v, %v; want mode %o", name, info, err, mode)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "offload.conf.example")); err == nil {
+		t.Error("the example was copied")
 	}
 }
 

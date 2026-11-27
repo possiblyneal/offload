@@ -21,6 +21,7 @@ systemctl --user disable --now offload-health.timer >/dev/null 2>&1 || true
 SYSTEMD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 rm -f "$HOME/.local/bin/offload" "$HOME/.local/share/offload/auto.bash" \
   "$SYSTEMD/offload-health.service" "$SYSTEMD/offload-health.timer"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/offload"
 systemctl --user daemon-reload
 
 if dpkg -s nfs-kernel-server >/dev/null 2>&1; then

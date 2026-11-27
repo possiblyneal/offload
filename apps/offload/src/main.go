@@ -19,7 +19,8 @@ import (
 	"time"
 )
 
-// configDir is set at build time by install.sh to the unit's config/ folder.
+// configDir is set at build time by install.sh to the installed copy of the unit's config/
+// folder, outside any checkout.
 var configDir string
 
 // scopedExportRoot is set by the restricted-view installer. An absent view
